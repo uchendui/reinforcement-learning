@@ -127,11 +127,11 @@ class TrainReinforce:
                                                                 self.rnb.q_values_ph: q_values})
 
     def save(self):
-        """Saves the Q network."""
+        """Saves the network."""
         self.rnb.saver.save(self.sess, self.save_path)
 
     def load(self):
-        """Loads the Q network."""
+        """Loads the network."""
         self.rnb.saver.restore(self.sess, self.save_path)
 
     def sample(self):
