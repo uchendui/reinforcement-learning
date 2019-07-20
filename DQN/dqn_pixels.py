@@ -28,16 +28,22 @@ class TrainDQN:
                  ):
         """
         Use DQN to train an open ai gym-like environment
-        :param env:
-        :param max_steps: Maximum number of steps to train for
-        :param max_eps: Starting exploration factor
-        :param min_eps: Exploration factor to decay towards
-        :param max_episode_len: Maximum length of an individual episode
-        :param render: True to render the environment, else False
-        :param print_freq: Displays logging information every 'print_freq'
-        episodes
-        :return: None
-        :type env: gym.Env
+        Args:
+            env: gym.Env where our agent resides
+            seed: Random seed for reproducibility
+            gamma: Discount factor
+            max_eps: Starting exploration factor
+            min_eps: Exploration factor to decay towards
+            max_episode_len: Maximum length of an individual episode
+            render: True to render the environment, else False
+            print_freq: Displays logging information every 'print_freq' episodes
+            load_path: (str) Path to load existing model from
+            save_path: (str) Path to save model during training
+            max_steps: maximum number of times to sample the environment
+            buffer_capacity: How many state, action, next state, reward tuples the replay buffer should store
+            max_episode_len: Maximum number of timesteps in an episode
+            eps_decay_rate: lambda parameter in exponential decay for epsilon
+            target_update_fraction: Fraction of max_steps update the target network
         """
         np.random.seed(seed)
         self.env = env
@@ -71,9 +77,8 @@ class TrainDQN:
             print(f'Successfully loaded model from {load_path}')
 
     def learn(self):
-        """
-        Reinforcement learning via Deep Q Networks (DQN)
-        """
+        """Learns via Deep-Q-Networks (DQN)"""
+
         obs = self.env.reset()
         mean_reward = None
         total_reward = 0
@@ -130,26 +135,23 @@ class TrainDQN:
                     # Model saving inspired by Open AI Baseline implementation
                     if (mean_reward is None or new_mean_reward >= mean_reward) and self.save_path is not None:
                         print(f"Saving model due to mean reward increase:{mean_reward} -> {new_mean_reward}")
-                        save_path = f"{self.save_path}_model"
+                        print(f'Location: {self.save_path}')
                         self.save()
                         mean_reward = new_mean_reward
 
     def act(self, observation):
+        """Takes an action given the observation.
+        Args:
+            observation: observation from the environment
+        Returns:
+            integer index of the selected action
         """
-        Take an action given the observation
-        :param observation: observation of the environment
-        :return:
-        """
-
         pred = self.sess.run([self.q_network.output_pred],
                              feed_dict={self.q_network.input_ph: np.expand_dims(observation, axis=0)})
         return np.argmax(pred)
 
     def update(self):
-        """
-        Update the Q network
-        :return: None or evaluation metrics
-        """
+        """Applies gradients to the Q network computed from a minibatch of self.batch_size."""
         if self.batch_size <= self.buffer.size():
             self.num_updates += 1
 
@@ -183,9 +185,11 @@ class TrainDQN:
                                                self.q_network.action_indices_ph: action})
 
     def save(self):
+        """Saves the Q network."""
         self.q_network.saver.save(self.sess, self.save_path)
 
     def load(self):
+        """Loads the Q network."""
         self.q_network.saver.restore(self.sess, self.save_path)
 
     def plot_rewards(self, path=None):

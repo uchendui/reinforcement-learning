@@ -5,6 +5,14 @@ from tensorflow.contrib import layers
 class NetworkBuilder:
     def __init__(self, input_dim, output_dim, layers=(512,), activations=(tf.nn.relu, None),
                  conv=False):
+        """Creates a neural network. Derived classes handle specific losses and opts.
+        Args:
+            input_dim: Input dimensions
+            output_dim: Output dimensions
+            layers: list of hidden unit numbers for each layer
+            activations: activations for each layer
+            conv: True for convolutional neural network, False for multi-layer perceptron
+        """
         assert len(layers) > 0, 'There must be at least one hidden layer'
 
         self.input_dim = input_dim
@@ -14,6 +22,11 @@ class NetworkBuilder:
         self.conv = conv
 
     def create_network(self):
+        """Creates a neural network.
+        Returns:
+            input_ph: Placeholder for the inputs.
+            output_pred: Tensor for the output layer.
+        """
         if self.conv:
             input_ph = tf.placeholder(dtype=tf.float32, shape=[None, *self.input_dim])
             network = tf.image.rgb_to_grayscale(input_ph)
@@ -57,19 +70,20 @@ class NetworkBuilder:
                     layer = activation(layer)
             output_pred = layer
 
+        self.saver = tf.train.Saver()
         return input_ph, output_pred
 
 
 class QNetworkBuilder(NetworkBuilder):
     def __init__(self, input_dim, output_dim, layers=(512,), activations=(tf.nn.relu, None), scope='q_network',
                  conv=False):
+        """Creates a Q-network and defines ops."""
         super(QNetworkBuilder, self).__init__(input_dim, output_dim, layers, activations, conv)
         with tf.variable_scope(scope):
             # Create variables
             self.input_ph, self.output_pred = self.create_network()
             self.target_ph = tf.placeholder(dtype=tf.float32, shape=[None])
             self.action_indices_ph = tf.placeholder(dtype=tf.int32, shape=[None])
-            self.saver = tf.train.Saver()
 
             # Create loss function
             batch_range = tf.range(start=0, limit=tf.shape(self.action_indices_ph)[0])
@@ -83,11 +97,12 @@ class QNetworkBuilder(NetworkBuilder):
 
 
 class ReinforceNetworkBuilder(NetworkBuilder):
-    def __init__(self, input_dim, output_dim, layers=(512,), activations=(tf.nn.relu, None), scope='q_network',
+    def __init__(self, input_dim, output_dim, layers=(512,), activations=(tf.nn.relu, None), scope='reinforce_network',
                  conv=False):
+        """Creates a network for REINFORCE and defines ops."""
         super(ReinforceNetworkBuilder, self).__init__(input_dim, output_dim, layers, activations, conv)
         with tf.variable_scope(scope):
-            # Create additional variables
+            # Create additional inputs
             self.input_ph, self.output_pred = self.create_network()
             self.q_values_ph = tf.placeholder(dtype=tf.float32, shape=[None], name='Reward-to-go')
             self.actions_ph = tf.placeholder(dtype=tf.float32, shape=[None, self.output_dim], name='actions')
