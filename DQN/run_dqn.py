@@ -1,15 +1,15 @@
 import gym
 import time
 import numpy as np
-from dqn_pixels import TrainDQN
-# from dqn import TrainDQN
+# from dqn_pixels import TrainDQN
+from dqn import TrainDQN
 import tensorflow as tf
 
 
 def main():
     with tf.Session() as sess:
-        # env_name = 'CartPole-v0'
-        env_name = 'CubeCrash-v0'
+        env_name = 'CartPole-v0'
+        # env_name = 'CubeCrash-v0'
         env = gym.make(env_name)
         dqn = TrainDQN(env,
                        sess,

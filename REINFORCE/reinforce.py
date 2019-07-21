@@ -1,9 +1,8 @@
 import gym
-import warnings
 import numpy as np
 import tensorflow as tf
 import matplotlib.pyplot as plt
-from util.network import ReinforceNetworkBuilder
+from util.network import PolicyNetworkBuilder
 
 
 class Trajectory:
@@ -70,11 +69,11 @@ class TrainReinforce:
         self.save_path = save_path
         self.rewards = []
 
-        self.rnb = ReinforceNetworkBuilder(self.input_dim,
-                                           self.output_dim,
-                                           layers=(32, 32,),
-                                           activations=(tf.nn.relu, tf.nn.relu, tf.nn.softmax),
-                                           scope='reinforce_network')
+        self.rnb = PolicyNetworkBuilder(self.input_dim,
+                                        self.output_dim,
+                                        layers=(32, 32,),
+                                        activations=(tf.nn.relu, tf.nn.relu, tf.nn.softmax),
+                                        scope='reinforce_network')
 
         if load_path is not None:
             self.rnb.saver.restore(sess, load_path)
