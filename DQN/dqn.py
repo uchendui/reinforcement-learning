@@ -1,7 +1,10 @@
+import sys
 import gym
 import numpy as np
 import tensorflow as tf
 import matplotlib.pyplot as plt
+
+sys.path.append('../')
 
 from util.network import QNetworkBuilder
 from util.replay_buffer import ReplayBuffer
