@@ -166,7 +166,7 @@ class ActorCriticNetworkBuilder(NetworkBuilder):
         self.loss = tf.reduce_mean(weighted_negative_likelihoods)
 
         # Optimizer
-        self.adam = tf.train.AdamOptimizer(learning_rate=0.0001)
+        self.adam = tf.train.AdamOptimizer(learning_rate=0.00005)
         self.opt = self.adam.minimize(self.loss)
 
 
