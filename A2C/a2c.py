@@ -34,12 +34,15 @@ class Worker(mp.Process):
         self.render = render
         self.conn = conn
         self.experiences = experiences
+        self.episode_reward = 0
         self.obs = self.env.reset()
 
     def act(self, observation):
         """Select an action according to the policy."""
         pred = self.sess.run(self.ac.actor.output_pred,
                              feed_dict={self.ac.actor.input_ph: np.reshape(observation, (1, self.input_dim))})
+        # x = np.argmax(pred.flatten())
+        # return np.argmax(pred.flatten())
         return np.random.choice(range(self.output_dim), p=pred.flatten())
 
     def step(self):
@@ -51,10 +54,13 @@ class Worker(mp.Process):
             self.env.render()
         action = self.act(self.obs)
         obs, rew, done, _ = self.env.step(action)
+        self.episode_reward += rew
         self.experiences.put((self.obs, action, rew, obs, done))
         self.obs = obs
         if done:
             self.obs = self.env.reset()
+            print(f'Episode Reward: {self.episode_reward}')
+            self.episode_reward = 0
 
     def listen_for_commands(self):
         """Listens for commands from the global worker."""
@@ -66,7 +72,6 @@ class Worker(mp.Process):
                 pass
             elif msg == MSG_STEP:
                 self.step()
-            # print(f'{msg} from worker {self.id}')
 
     def run(self):
         self.create_shared_variables()
@@ -168,12 +173,12 @@ class TrainA2C:
         _, policy_loss = self.sess.run([self.ac.opt, self.ac.loss], feed_dict={self.ac.actor.input_ph: states,
                                                                                self.ac.advantage_ph: advantage,
                                                                                self.ac.actor.actions_ph: action})
-        print(f'Policy loss:{policy_loss}\nCritic loss:{value_loss}')
+        # print(f'Policy loss:{policy_loss}\nCritic loss:{value_loss}')
 
     def learn(self):
         """Trains an agent via advantage actor-critic"""
         self.sess.run(tf.global_variables_initializer())
-        for t in range(40000):
+        for t in range(5000):
             # Sample from each environment
             self.send_message(MSG_STEP)
 
@@ -183,7 +188,7 @@ class TrainA2C:
             # Update the actor and critic models
             self.update(*batch)
 
-            print('Processed Batch')
+            # print('Processed Batch')
         self.send_message(MSG_STOP)
 
     def send_message(self, msg):
@@ -204,6 +209,7 @@ class TrainA2C:
                 time.sleep(0.5)
         self.learn()
         for w in self.workers:
+            w.terminate()
             w.join()
 
 
@@ -211,7 +217,7 @@ def main():
     # The default method, "fork", copies over the tensorflow module from the parent process
     #   which disables us from using GPU resources
     mp.set_start_method('spawn')
-    t = TrainA2C(32, 'CartPole-v0', render=True)
+    t = TrainA2C(32, 'CartPole-v0', render=False)
     t.start()
 
 
