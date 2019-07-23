@@ -3,15 +3,15 @@ import gym
 import sys
 import time
 import json
-import logging
 import numpy as np
 import tensorflow as tf
 import multiprocessing as mp
 
-from absl import flags
+sys.path.append('../')
+
 from util.ports import find_open_ports
 from util.network import ActorCriticNetworkBuilder
-from tensorflow.core.protobuf import cluster_pb2 as cluster
+from util.misc import to_one_hot
 
 MSG_STOP = 'stop'
 MSG_STEP = 'step'
@@ -44,6 +44,9 @@ class Worker(mp.Process):
 
     def step(self):
         """Performs a single step of the environment and adds a transition to the experience queue."""
+        # print(f'Worker {self.id} Parameters:')
+        # print(self.sess.run(tf.trainable_variables())[0][0])
+
         if self.render:
             self.env.render()
         action = self.act(self.obs)
@@ -58,31 +61,33 @@ class Worker(mp.Process):
         while True:
             msg = self.conn.recv()
             if msg == MSG_STOP:
-                # self.server.join()
                 break
             elif msg == MSG_RESET:
                 pass
             elif msg == MSG_STEP:
                 self.step()
-            print(f'{msg} from worker {self.id}')
+            # print(f'{msg} from worker {self.id}')
 
     def run(self):
+        self.create_shared_variables()
+        self.listen_for_commands()
+
+    def create_shared_variables(self):
+        """Creates shared variables and a tensorflow server session."""
         config = json.loads(os.environ.get('TF_CONFIG'))
         cluster = tf.train.ClusterSpec(config)
         self.server = tf.distribute.Server(cluster, job_name='worker', task_index=self.id)
-        self.create_parameters()
-        self.listen_for_commands()
+        with tf.device("/job:global/task:0"):
+            self.ac = ActorCriticNetworkBuilder(self.input_dim, self.output_dim)
 
-    def create_parameters(self):
-        self.ac = ActorCriticNetworkBuilder(self.input_dim, self.output_dim)
-        print('Worker: Created variables')
+        print(f'Worker {self.id}: Created variables')
         self.sess = tf.Session(target=self.server.target)
-        print('Worker Session Created')
+        print(f'Worker {self.id}: Session Created')
 
         while len(self.sess.run(tf.report_uninitialized_variables())) > 0:
-            print("Worker %d: waiting for variable initialization..." % self.id)
+            print(f'Worker {self.id}: waiting for variable initialization...')
             time.sleep(1.0)
-        print("Worker %d: variables initialized" % self.id)
+        print(f'Worker {self.id}: Variables initialized')
 
 
 class TrainA2C:
@@ -118,25 +123,67 @@ class TrainA2C:
         cluster = tf.train.ClusterSpec(jobs)
         self.server = tf.distribute.Server(cluster, job_name='global', task_index=0)
         self.sess = tf.Session(target=self.server.target)
-        self.ac = ActorCriticNetworkBuilder(self.input_dim, self.output_dim)
+        with tf.device("/job:global/task:0"):
+            self.ac = ActorCriticNetworkBuilder(self.input_dim, self.output_dim)
 
     def get_transitions(self):
         """Waits for every environment to be sampled."""
         not_rec = self.num_workers
+        samples = []
         while not_rec > 0:
             while not self.experiences.empty():
-                print(self.experiences.get())
+                samples.append(self.experiences.get())
                 not_rec -= 1
+
+        return list(map(np.array, zip(*samples)))
+
+    def update(self, states, action, reward, next_states, done):
+        # Adjust shapes for input to the models
+        action = to_one_hot(action, self.output_dim)
+        reward = reward.reshape(len(reward), 1)
+
+        #######################################################
+        # Update value function network
+        #######################################################
+        next_state_values = 0.99 * self.sess.run(self.ac.critic.output_pred,
+                                                 feed_dict={self.ac.critic.input_ph: next_states})
+        state_values = self.sess.run(self.ac.critic.output_pred, feed_dict={self.ac.critic.input_ph: states})
+
+        # Adjust the targets for non-terminal states
+        targets = np.copy(reward)
+        loc = np.argwhere(done != True).flatten()
+        if len(loc) > 0:
+            targets[loc] = np.add(
+                targets[loc],
+                next_state_values[loc].reshape(next_state_values[loc].shape[0], 1), casting='unsafe')
+
+        _, value_loss = self.sess.run([self.ac.critic.opt, self.ac.critic.loss],
+                                      feed_dict={self.ac.critic.input_ph: states,
+                                                 self.ac.critic.target_ph: targets})
+
+        #######################################################
+        # Update critic network
+        #######################################################
+        advantage = (reward + 0.99 * next_state_values) - state_values
+        _, policy_loss = self.sess.run([self.ac.opt, self.ac.loss], feed_dict={self.ac.actor.input_ph: states,
+                                                                               self.ac.advantage_ph: advantage,
+                                                                               self.ac.actor.actions_ph: action})
+        print(f'Policy loss:{policy_loss}\nCritic loss:{value_loss}')
 
     def learn(self):
         """Trains an agent via advantage actor-critic"""
         self.sess.run(tf.global_variables_initializer())
-        for t in range(1000):
+        for t in range(40000):
             # Sample from each environment
             self.send_message(MSG_STEP)
 
             # Aggregate transitions
-            self.get_transitions()
+            batch = self.get_transitions()
+
+            # Update the actor and critic models
+            self.update(*batch)
+
+            print('Processed Batch')
         self.send_message(MSG_STOP)
 
     def send_message(self, msg):
@@ -152,15 +199,19 @@ class TrainA2C:
         for i, w in enumerate(self.workers):
             w.start()
             if i < self.num_workers - 1:
-                time.sleep(5)  # Need to separate workers starting due to resource usage
+                # Need to separate workers starting due to resource usage
+                # this can be adjusted for faster/slower machines
+                time.sleep(0.5)
         self.learn()
         for w in self.workers:
             w.join()
 
 
 def main():
+    # The default method, "fork", copies over the tensorflow module from the parent process
+    #   which disables us from using GPU resources
     mp.set_start_method('spawn')
-    t = TrainA2C(2, 'CartPole-v0', render=True)
+    t = TrainA2C(32, 'CartPole-v0', render=True)
     t.start()
 
 

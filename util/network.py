@@ -92,26 +92,26 @@ class QNetworkBuilder(NetworkBuilder):
 
             # Optimizer
             self.adam = tf.train.AdamOptimizer()
-            self.opt = tf.train.AdamOptimizer().minimize(self.loss)
+            self.opt = self.adam.minimize(self.loss)
 
 
 class ValueNetworkBuilder(NetworkBuilder):
-    def __init__(self, input_dim, output_dim=1, layers=(512,), activations=(tf.nn.relu, None), scope='value_network',
+    def __init__(self, input_dim, layers=(512,), activations=(tf.nn.relu, None), scope='value_network',
                  conv=False):
         """Creates a network for estimating the value function. Very similar to the QNetworkBuilder"""
-        super(ValueNetworkBuilder, self).__init__(input_dim, output_dim, layers, activations, conv)
+        super(ValueNetworkBuilder, self).__init__(input_dim, 1, layers, activations, conv)
         with tf.variable_scope(scope):
             # Create variables
             self.input_ph, self.output_pred = self.create_network()
             self.target_ph = tf.placeholder(dtype=tf.float32, shape=[None, 1])
-            self.action_indices_ph = tf.placeholder(dtype=tf.int32, shape=[None])
+            # self.action_indices_ph = tf.placeholder(dtype=tf.int32, shape=[None])
 
             # Create loss function
             self.loss = tf.losses.mean_squared_error(self.output_pred, self.target_ph)
 
             # Optimizer
             self.adam = tf.train.AdamOptimizer()
-            self.opt = tf.train.AdamOptimizer().minimize(self.loss)
+            self.opt = self.adam.minimize(self.loss)
 
 
 class PolicyNetworkBuilder(NetworkBuilder):
@@ -130,10 +130,9 @@ class PolicyNetworkBuilder(NetworkBuilder):
             negative_likelihoods = tf.nn.softmax_cross_entropy_with_logits(labels=self.actions_ph, logits=logits)
             weighted_negative_likelihoods = tf.multiply(negative_likelihoods, self.q_values_ph)
             self.loss = tf.reduce_mean(weighted_negative_likelihoods)
-
             # Optimizer
             self.adam = tf.train.AdamOptimizer()
-            self.opt = tf.train.AdamOptimizer().minimize(self.loss)
+            self.opt = self.adam.minimize(self.loss)
 
 
 class ActorCriticNetworkBuilder(NetworkBuilder):
@@ -145,22 +144,30 @@ class ActorCriticNetworkBuilder(NetworkBuilder):
 
         # Create two networks: one for the policy and one for the value function
         with tf.variable_scope('actor'):
-            self.actor = PolicyNetworkBuilder(input_dim, output_dim, layers, activations, scope, conv)
-        with tf.variable_scope('critic'):
-            self.critic = ValueNetworkBuilder(input_dim=input_dim,
-                                              output_dim=1,
+            self.actor = PolicyNetworkBuilder(input_dim=input_dim,
+                                              output_dim=output_dim,
                                               layers=layers,
                                               activations=activations,
                                               scope=scope,
                                               conv=conv)
+        with tf.variable_scope('critic'):
+            self.critic = ValueNetworkBuilder(input_dim=input_dim,
+                                              layers=layers,
+                                              activations=(tf.nn.relu, None),  # Value function needs linear output
+                                              scope=scope,
+                                              conv=conv)
 
-        self.advantage_ph = tf.placeholder(dtype=tf.float32, shape=[None], name='Advantage')
+        self.advantage_ph = tf.placeholder(dtype=tf.float32, shape=[None, 1], name='Advantage')
 
         # Loss will be the same as the policy network!
         logits = self.actor.output_pred
         negative_likelihoods = tf.nn.softmax_cross_entropy_with_logits(labels=self.actor.actions_ph, logits=logits)
         weighted_negative_likelihoods = tf.multiply(negative_likelihoods, self.advantage_ph)
         self.loss = tf.reduce_mean(weighted_negative_likelihoods)
+
+        # Optimizer
+        self.adam = tf.train.AdamOptimizer(learning_rate=0.0001)
+        self.opt = self.adam.minimize(self.loss)
 
 
 def main():

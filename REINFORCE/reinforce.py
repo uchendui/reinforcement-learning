@@ -3,6 +3,7 @@ import numpy as np
 import tensorflow as tf
 import matplotlib.pyplot as plt
 from util.network import PolicyNetworkBuilder
+from util.misc import to_one_hot
 
 
 class Trajectory:
@@ -18,24 +19,13 @@ class Trajectory:
         """
 
         self.states = np.array(states)
-        self.actions = self.to_one_hot(actions, num_actions)
+        self.actions = to_one_hot(actions, num_actions)
         self.q_values = np.zeros(shape=len(self.actions))
         mean_reward = np.mean(rewards)
         std = np.std(rewards)
         std = 1 if std == 0 else std
         for i in range(len(states)):
             self.q_values[i] = (np.sum(rewards[i:]) - mean_reward) / std
-
-    def to_one_hot(self, indices, num_actions):
-        """
-        Converts a list of indices to a one-hot representation.
-
-        For example, to_one_hot((1,3),4) -> [[0,1,0,0], [0, 0, 0, 1]]
-        Args:
-            indices:
-            num_actions: Number of possible actions. (length of one-hot vector)
-        """
-        return np.eye(num_actions)[indices]
 
 
 class TrainReinforce:
