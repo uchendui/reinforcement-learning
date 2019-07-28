@@ -33,9 +33,8 @@ class NetworkBuilder:
             network = tf.contrib.layers.conv2d(network, 30, kernel_size=2, activation_fn=tf.nn.relu, stride=2)
             network = tf.contrib.layers.conv2d(network, 30, kernel_size=1, activation_fn=tf.nn.relu, stride=1)
             network = tf.contrib.layers.flatten(network)
-            network = tf.contrib.layers.fully_connected(network, 512, activation_fn=tf.nn.relu)
+            network = tf.contrib.layers.fully_connected(network, 128, activation_fn=tf.nn.relu)
             output_pred = tf.contrib.layers.fully_connected(network, self.output_dim, activation_fn=None)
-
         else:
             weights = [tf.get_variable(name='W0',
                                        shape=[self.input_dim, self.layer_sizes[0]],
@@ -74,100 +73,87 @@ class NetworkBuilder:
 
 
 class QNetworkBuilder(NetworkBuilder):
-    def __init__(self, input_dim, output_dim, layers=(512,), activations=(tf.nn.relu, None), scope='q_network',
-                 conv=False):
+    def __init__(self, input_dim, output_dim, layers=(512,), activations=(tf.nn.relu, None),
+                 conv=False, learning_rate=0.001):
         """Creates a Q-network and defines ops."""
         super(QNetworkBuilder, self).__init__(input_dim, output_dim, layers, activations, conv)
-        with tf.variable_scope(scope):
-            # Create variables
-            self.input_ph, self.output_pred = self.create_network()
-            self.target_ph = tf.placeholder(dtype=tf.float32, shape=[None])
-            self.action_indices_ph = tf.placeholder(dtype=tf.int32, shape=[None])
+        # Create variables
+        self.input_ph, self.output_pred = self.create_network()
+        self.target_ph = tf.placeholder(dtype=tf.float32, shape=[None])
+        self.action_indices_ph = tf.placeholder(dtype=tf.int32, shape=[None])
 
-            # Create loss function
-            batch_range = tf.range(start=0, limit=tf.shape(self.action_indices_ph)[0])
-            indices = tf.stack((batch_range, self.action_indices_ph), axis=1)
-            self.action_values = tf.gather_nd(self.output_pred, indices)
-            self.loss = tf.losses.mean_squared_error(self.target_ph, self.action_values)
+        # Create loss function
+        batch_range = tf.range(start=0, limit=tf.shape(self.action_indices_ph)[0])
+        indices = tf.stack((batch_range, self.action_indices_ph), axis=1)
+        self.action_values = tf.gather_nd(self.output_pred, indices)
+        self.loss = tf.losses.mean_squared_error(self.target_ph, self.action_values)
 
-            # Optimizer
-            self.adam = tf.train.AdamOptimizer()
-            self.opt = self.adam.minimize(self.loss)
+        # Optimizer
+        self.adam = tf.train.AdamOptimizer(learning_rate=learning_rate)
+        self.opt = self.adam.minimize(self.loss)
 
 
 class ValueNetworkBuilder(NetworkBuilder):
-    def __init__(self, input_dim, layers=(512,), activations=(tf.nn.relu, None), scope='value_network',
-                 conv=False):
+    def __init__(self, input_dim, layers=(512,), activations=(tf.nn.relu, None),
+                 conv=False, learning_rate=0.001):
         """Creates a network for estimating the value function. Very similar to the QNetworkBuilder"""
         super(ValueNetworkBuilder, self).__init__(input_dim, 1, layers, activations, conv)
-        with tf.variable_scope(scope):
-            # Create variables
-            self.input_ph, self.output_pred = self.create_network()
-            self.target_ph = tf.placeholder(dtype=tf.float32, shape=[None, 1])
-            # self.action_indices_ph = tf.placeholder(dtype=tf.int32, shape=[None])
+        # Create variables
+        self.input_ph, self.output_pred = self.create_network()
+        self.target_ph = tf.placeholder(dtype=tf.float32, shape=[None, 1])
+        # self.action_indices_ph = tf.placeholder(dtype=tf.int32, shape=[None])
 
-            # Create loss function
-            self.loss = tf.losses.mean_squared_error(self.output_pred, self.target_ph)
+        # Create loss function
+        self.loss = tf.losses.mean_squared_error(self.output_pred, self.target_ph)
 
-            # Optimizer
-            self.adam = tf.train.AdamOptimizer()
-            self.opt = self.adam.minimize(self.loss)
+        # Optimizer
+        self.adam = tf.train.AdamOptimizer(learning_rate=learning_rate)
+        self.opt = self.adam.minimize(self.loss)
 
 
 class PolicyNetworkBuilder(NetworkBuilder):
-    def __init__(self, input_dim, output_dim, layers=(512,), activations=(tf.nn.relu, None), scope='reinforce_network',
-                 conv=False):
+    def __init__(self, input_dim, output_dim, layers=(512,), activations=(tf.nn.relu, tf.nn.softmax),
+                 conv=False, learning_rate=0.001):
         """Creates a network for policy gradient and defines ops."""
         super(PolicyNetworkBuilder, self).__init__(input_dim, output_dim, layers, activations, conv)
-        with tf.variable_scope(scope):
-            # Create additional inputs
-            self.input_ph, self.output_pred = self.create_network()
-            self.q_values_ph = tf.placeholder(dtype=tf.float32, shape=[None], name='Reward-to-go')
-            self.actions_ph = tf.placeholder(dtype=tf.float32, shape=[None, self.output_dim], name='actions')
 
-            # Create loss function for policy gradient
-            logits = self.output_pred
-            negative_likelihoods = tf.nn.softmax_cross_entropy_with_logits(labels=self.actions_ph, logits=logits)
-            weighted_negative_likelihoods = tf.multiply(negative_likelihoods, self.q_values_ph)
-            self.loss = tf.reduce_mean(weighted_negative_likelihoods)
-            # Optimizer
-            self.adam = tf.train.AdamOptimizer()
-            self.opt = self.adam.minimize(self.loss)
+        # Create additional inputs
+        self.input_ph, self.output_pred = self.create_network()
+        if conv:
+            self.output_pred = tf.nn.softmax(self.output_pred)
+        self.baseline_ph = tf.placeholder(dtype=tf.float32, shape=[None], name='Baseline')
+        self.actions_ph = tf.placeholder(dtype=tf.float32, shape=[None, self.output_dim], name='actions')
+
+        # Create loss function for policy gradient
+        logits = self.output_pred
+        negative_likelihoods = tf.nn.softmax_cross_entropy_with_logits(labels=self.actions_ph, logits=logits)
+        weighted_negative_likelihoods = tf.multiply(negative_likelihoods, self.baseline_ph)
+        self.loss = tf.reduce_mean(weighted_negative_likelihoods)
+        # Optimizer
+        self.adam = tf.train.AdamOptimizer(learning_rate=learning_rate)
+        self.opt = self.adam.minimize(self.loss)
 
 
-class ActorCriticNetworkBuilder(NetworkBuilder):
+class ActorCriticNetworkBuilder:
     """Creates a network for A2C and A3C and defines ops"""
 
-    def __init__(self, input_dim, output_dim, layers=(512,), activations=(tf.nn.relu, tf.nn.softmax),
-                 scope='ac_network', conv=False):
-        super(ActorCriticNetworkBuilder, self).__init__(input_dim, output_dim, layers, activations, conv)
-
+    def __init__(self, input_dim, output_dim, actor_layers=(512,), critic_layers=(512,),
+                 actor_activations=(tf.nn.relu, tf.nn.softmax),
+                 critic_activations=(tf.nn.relu, None), conv=False, actor_lr=0.0001, critic_lr=0.001):
         # Create two networks: one for the policy and one for the value function
         with tf.variable_scope('actor'):
             self.actor = PolicyNetworkBuilder(input_dim=input_dim,
                                               output_dim=output_dim,
-                                              layers=layers,
-                                              activations=activations,
-                                              scope=scope,
-                                              conv=conv)
+                                              layers=actor_layers,
+                                              activations=actor_activations,
+                                              conv=conv,
+                                              learning_rate=actor_lr)
         with tf.variable_scope('critic'):
             self.critic = ValueNetworkBuilder(input_dim=input_dim,
-                                              layers=layers,
-                                              activations=(tf.nn.relu, None),  # Value function needs linear output
-                                              scope=scope,
-                                              conv=conv)
-
-        self.advantage_ph = tf.placeholder(dtype=tf.float32, shape=[None, 1], name='Advantage')
-
-        # Loss will be the same as the policy network!
-        logits = self.actor.output_pred
-        negative_likelihoods = tf.nn.softmax_cross_entropy_with_logits(labels=self.actor.actions_ph, logits=logits)
-        weighted_negative_likelihoods = tf.multiply(negative_likelihoods, self.advantage_ph)
-        self.loss = tf.reduce_mean(weighted_negative_likelihoods)
-
-        # Optimizer
-        self.adam = tf.train.AdamOptimizer(learning_rate=0.00005)
-        self.opt = self.adam.minimize(self.loss)
+                                              layers=critic_layers,
+                                              activations=critic_activations,  # Value function needs linear output
+                                              conv=conv,
+                                              learning_rate=critic_lr)
 
 
 def main():

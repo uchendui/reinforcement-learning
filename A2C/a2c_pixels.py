@@ -6,7 +6,7 @@ import json
 import numpy as np
 import multiprocessing as mp
 
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+# os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 import tensorflow as tf
 
 sys.path.append('../')
@@ -44,7 +44,7 @@ class Worker(mp.Process):
 
     def run(self):
         """This method is called once a 'Worker' process is started."""
-        os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+        # os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
         self.create_shared_variables()
         self.listen_for_commands()
 
@@ -56,11 +56,8 @@ class Worker(mp.Process):
         with tf.device("/job:global/task:0"):
             self.ac = ActorCriticNetworkBuilder(self.input_dim,
                                                 self.output_dim,
-                                                actor_layers=(32, 32),
-                                                critic_layers=(32, 32),
-                                                actor_activations=(tf.nn.relu, tf.nn.relu, tf.nn.softmax),
-                                                critic_activations=(tf.nn.relu, tf.nn.relu, None))
-
+                                                conv=True,
+                                                )
         print(f'Worker {self.id}: Created variables')
         self.sess = tf.Session(target=self.server.target)
         print(f'Worker {self.id}: Session Created')
@@ -84,7 +81,7 @@ class Worker(mp.Process):
     def act(self, observation):
         """Select an action according to the policy."""
         pred = self.sess.run(self.ac.actor.output_pred,
-                             feed_dict={self.ac.actor.input_ph: np.reshape(observation, (1, self.input_dim))})
+                             feed_dict={self.ac.actor.input_ph: np.expand_dims(observation, axis=0)})
         return np.random.choice(range(self.output_dim), p=pred.flatten())
 
     def step(self):
@@ -119,7 +116,7 @@ class TrainA2C:
         self.num_workers = num_workers
         env = gym.make(env_name)
         self.env_name = env_name
-        self.input_dim = env.observation_space.shape[0]
+        self.input_dim = env.observation_space.shape
         self.output_dim = env.action_space.n
         self.par_connections, self.child_connections = zip(*[mp.Pipe() for i in range(num_workers)])
         self.transition_queue = mp.Queue()
@@ -153,10 +150,7 @@ class TrainA2C:
         with tf.device("/job:global/task:0"):
             self.ac = ActorCriticNetworkBuilder(self.input_dim,
                                                 self.output_dim,
-                                                actor_layers=(32, 32),
-                                                critic_layers=(32, 32),
-                                                actor_activations=(tf.nn.relu, tf.nn.relu, tf.nn.softmax),
-                                                critic_activations=(tf.nn.relu, tf.nn.relu, None))
+                                                conv=True)
 
     def get_transitions(self):
         """Waits for every worker to sample the environment.
@@ -282,7 +276,7 @@ def main():
     # The default method, "fork", copies over the tensorflow module from the parent process
     #   which is problematic w.r.t GPU resources
     mp.set_start_method('spawn')
-    t = TrainA2C(4, 'CartPole-v0', max_steps=10000, print_freq=10, render=False)
+    t = TrainA2C(1, 'CubeCrash-v0', max_steps=100000, print_freq=10, render=False)
     t.start()
 
 

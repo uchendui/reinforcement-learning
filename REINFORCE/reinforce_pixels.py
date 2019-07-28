@@ -52,7 +52,7 @@ class TrainReinforce:
         self.max_episodes = max_episodes
         self.print_freq = print_freq
         self.env = env
-        self.input_dim = env.observation_space.shape[0]
+        self.input_dim = env.observation_space.shape
         self.output_dim = env.action_space.n
         self.sess = sess
         self.render = render
@@ -61,17 +61,15 @@ class TrainReinforce:
 
         self.rnb = PolicyNetworkBuilder(self.input_dim,
                                         self.output_dim,
-                                        layers=(32, 32,),
                                         learning_rate=0.0005,
-                                        activations=(tf.nn.relu, tf.nn.relu, tf.nn.softmax), )
-
+                                        conv=True)
         if load_path is not None:
             self.rnb.saver.restore(sess, load_path)
             print(f'Successfully loaded model from {load_path}')
 
     def act(self, observation):
         pred = self.sess.run(self.rnb.output_pred,
-                             feed_dict={self.rnb.input_ph: np.reshape(observation, (1, self.input_dim))})
+                             feed_dict={self.rnb.input_ph: np.expand_dims(observation, axis=0)})
         return np.random.choice(range(self.output_dim), p=pred.flatten())
 
     def reinforce(self):
@@ -166,13 +164,13 @@ class TrainReinforce:
 
 def main():
     with tf.Session() as sess:
-        env_name = 'CartPole-v0'
+        env_name = 'CubeCrash-v0'
         env = gym.make(env_name)
         reinforce = TrainReinforce(env,
                                    sess,
                                    render=False,
-                                   max_episodes=5000,
-                                   print_freq=10,
+                                   max_episodes=10000,
+                                   print_freq=100,
                                    save_path=f'checkpoints/{env_name}.ckpt')
         sess.run(tf.initialize_all_variables())
         reinforce.reinforce()

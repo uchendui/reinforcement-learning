@@ -66,8 +66,10 @@ class TrainDQN:
         self.buffer = ReplayBuffer(capacity=max_steps // 2 if buffer_capacity is None else buffer_capacity)
         self.target_update_freq = int(target_update_fraction * max_steps)
         self.learning_rate = lr
-        self.q_network = QNetworkBuilder(self.input_dim, self.output_dim, (64,), scope='q_network', conv=True)
-        self.target_network = QNetworkBuilder(self.input_dim, self.output_dim, (64,), scope='target_network', conv=True)
+        with tf.variable_scope('q_network'):
+            self.q_network = QNetworkBuilder(self.input_dim, self.output_dim, conv=True)
+        with tf.variable_scope('target_network'):
+            self.target_network = QNetworkBuilder(self.input_dim, self.output_dim, conv=True)
         self.update_target_network = [old.assign(new) for (new, old) in
                                       zip(tf.trainable_variables('q_network'),
                                           tf.trainable_variables('target_network'))]

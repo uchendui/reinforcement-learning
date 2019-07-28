@@ -1,236 +1,298 @@
+import os
 import gym
 import sys
 import time
-import logging
+import json
 import numpy as np
-import multiprocessing
+import multiprocessing as mp
+
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 import tensorflow as tf
 
 sys.path.append('../')
 
-from absl import flags
 from util.ports import find_open_ports
 from util.network import ActorCriticNetworkBuilder
-from util.replay_buffer import ReplayBuffer
-from tensorflow.core.protobuf import cluster_pb2 as cluster
-
-MSG_STOP = 'stop'
-MSG_STEP = 'step'
-MSG_RESET = 'reset'
+from util.misc import to_one_hot
 
 
-class Worker(multiprocessing.Process):
-    def __init__(self, worker_id,
+class Worker(mp.Process):
+    def __init__(self,
+                 worker_id,
                  conn,
+                 rew_queue,
+                 global_count,
                  env_name,
-                 cluster_config,
                  input_dim,
                  output_dim,
-                 render,
-                 max_episodes=10000,
-                 gamma=0.99,
-                 print_freq=10,
-                 save_path=None,
-                 load_path=None):
+                 max_steps,
+                 async_update_freq,
+                 gamma,
+                 render):
         super(Worker, self).__init__()
         self.id = worker_id
-        self.conn = conn
-        self.cluster = cluster_config
         self.env = gym.make(env_name)
         self.input_dim = input_dim
         self.output_dim = output_dim
+        self.max_steps = max_steps
+        self.async_update_freq = async_update_freq
         self.render = render
-        self.max_episodes = max_episodes
+        self.conn = conn
+        self.rew_queue = rew_queue
+        self.global_count = global_count
+        self.episode_reward = 0
         self.gamma = gamma
-        self.print_freq = print_freq
-        self.save_path = save_path
-
-    def reset(self):
-        self.env.reset()
-        for i in range(1000):
-            if self.render:
-                self.env.render()
-            obs, rew, done, _ = self.env.step(self.env.action_space.sample())
-            time.sleep(0.01)
-            if done:
-                obs = self.env.reset()
-
-    def update(self, sess, states, reward):
-        """Takes a single gradient step using a trajectory.
-        Args:
-            states: array of visited states
-            actions: array
-            q_values: array of q values corresponding to each state
-        """
-
-        # Calculate discounted predictions for the subsequent states using target network
-        state_values = self.gamma * sess.run(self.ac.critic.output_pred,
-                                             feed_dict={self.ac.critic.input_ph: states}, )
-
-        # Adjust the targets for non-terminal states
-        reward = reward.reshape(len(reward), 1)
-        targets = reward
-        loc = np.argwhere(done != True).flatten()
-        if len(loc) > 0:
-            max_q = np.amax(next_state_pred, axis=1)
-            targets[loc] = np.add(
-                targets[loc],
-                max_q[loc].reshape(max_q[loc].shape[0], 1),
-                casting='unsafe')
-
-        # Update the policy and the value function
-        # sess.run()
-        sess.run([self.ac.actor.opt, self.ac.actor.loss, self.ac.critic.opt, self.ac.critic.loss],
-                 feed_dict={self.ac.actor.input_ph: states, self.ac.critic.input_ph: states,
-                            self.ac.actor.q_values_ph: advantage, self.ac.critic.target_ph: targets})
-
-        # self.sess.run([self.rnb.opt, self.rnb.loss], feed_dict={self.rnb.input_ph: states,
-        #                                                         self.rnb.actions_ph: actions,
-        #                                                         self.rnb.q_values_ph: q_values})
-
-    def act(self, sess, obs):
-        pred = sess.run(self.ac.actor.output_pred, feed_dict={self.ac.actor.input_ph: obs})
-        return np.random.choice(range(self.output_dim), p=pred.flatten())
-
-    def sample(self, sess):
-        """Samples a single trajectory under the current policy."""
-        done = False
-        actions = []
-        states = []
-        rewards = []
-
-        obs = self.env.reset()
-        total_reward = 0
-        ep_len = 0
-        while not done:
-            states.append(obs)
-            if self.render:
-                self.env.render()
-
-            action = self.act(sess, obs)
-            obs, rew, done, _ = self.env.step(action)
-
-            total_reward += rew
-            ep_len += 1
-
-            rewards.append(rew)
-            actions.append(action)
-        return np.array(states), np.array(rewards), total_reward
-
-    def learn(self, sess):
-        obs = self.env.reset()
-        mean_reward = None
-        total_reward = 0
-        ep = 0
-        ep_len = 0
-        rand_actions = 0
-        for e in range(self.max_episodes):
-            # Sample trajectories from our policy (run it on the robot)
-            states, rewards, reward = self.sample(sess)
-            total_reward += reward
-
-            self.update(sess, states, rewards)
-            if e % self.print_freq == 0 and e > 0:
-                new_mean_reward = total_reward / self.print_freq
-                total_reward = 0
-                print(f"-------------------------------------------------------")
-                print(f"Mean {self.print_freq} Episode Reward: {new_mean_reward}")
-                # print(f"Exploration fraction: {eps}")
-                print(f"Total Episodes: {e}")
-                # print(f"Total timesteps: {t}")
-                print(f"-------------------------------------------------------")
-
-                # Model saving inspired by Open AI Baseline implementation
-                if (mean_reward is None or new_mean_reward >= mean_reward) and self.save_path is not None:
-                    print(f"Saving model due to mean reward increase:{mean_reward} -> {new_mean_reward}")
-                    # print(f'Location: {self.save_path}')
-                    # self.save()
-                    mean_reward = new_mean_reward
-
-            pass
-        pass
+        self.var_scope = f'worker_{self.id}'
+        self.obs = self.env.reset()
 
     def run(self):
-        server = tf.train.Server(self.cluster, job_name='worker', task_index=self.id)
-        with tf.Session(target=server.target) as sess:
-            with tf.device("/job:global/task:0"):
-                self.ac = ActorCriticNetworkBuilder(self.input_dim, self.output_dim)
-                self.global_counter = tf.get_variable('global_counter', dtype=tf.int32)
+        """This method is called once a 'Worker' process is started."""
+        os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+        self.create_shared_variables()
 
-            while len(sess.run(tf.report_uninitialized_variables())) > 0:
-                print("Worker %d: waiting for variable initialization..." % self.id)
-                time.sleep(1.0)
-            print("Worker %d: variables initialized" % self.id)
+        while self.global_count.value < self.max_steps:
+            transitions = self.sample()
 
-            self.learn(sess)
+            # global_vars_pre = self.sess.run(tf.trainable_variables(scope='global'))[0][0]
+            # local_vars_pre = self.sess.run(tf.trainable_variables(scope=self.var_scope))[0][0]
+            self.update(*transitions)
+            # global_vars_update = self.sess.run(tf.trainable_variables(scope='global'))[0][0]
+            # local_vars_update = self.sess.run(tf.trainable_variables(scope=self.var_scope))[0][0]
+
+            # copy the global network
+            self.sess.run(self.copy_global_network)
+            # global_vars_copy = self.sess.run(tf.trainable_variables(scope='global'))[0][0]
+            # local_vars_pre_copy = self.sess.run(tf.trainable_variables(scope=self.var_scope))[0][0]
+
+    def create_shared_variables(self):
+        """Creates shared variables and a tensorflow server session."""
+        config = json.loads(os.environ.get('TF_CONFIG'))
+        cluster = tf.train.ClusterSpec(config)
+        self.server = tf.distribute.Server(cluster, job_name='worker', task_index=self.id)
+        with tf.variable_scope('global'):
+            self.ac = ActorCriticNetworkBuilder(self.input_dim,
+                                                self.output_dim,
+                                                actor_layers=(32, 32),
+                                                critic_layers=(32, 32),
+                                                actor_activations=(tf.nn.relu, tf.nn.relu, tf.nn.softmax),
+                                                critic_activations=(tf.nn.relu, tf.nn.relu, None))
+
+        with tf.variable_scope(self.var_scope):
+            self.ac_copy = ActorCriticNetworkBuilder(self.input_dim,
+                                                     self.output_dim,
+                                                     actor_layers=(32, 32),
+                                                     critic_layers=(32, 32),
+                                                     actor_activations=(tf.nn.relu, tf.nn.relu, tf.nn.softmax),
+                                                     critic_activations=(tf.nn.relu, tf.nn.relu, None))
+
+            self.copy_global_network = [old.assign(new) for (new, old) in
+                                        zip(tf.trainable_variables(f'global'),
+                                            tf.trainable_variables(self.var_scope))]
+
+        print(f'Worker {self.id}: Created variables')
+        self.sess = tf.Session(target=self.server.target)
+        print(f'Worker {self.id}: Session Created')
+
+        local_vars = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=self.var_scope)
+        self.sess.run(tf.initialize_variables(local_vars))
+        print(f'Worker {self.id}: Initialized local variables')
+
+        while len(self.sess.run(tf.report_uninitialized_variables())) > 0:
+            print(f'Worker {self.id}: waiting for variable initialization...')
+            time.sleep(1.0)
+        print(f'Worker {self.id}: Variables initialized')
+
+    def act(self, observation):
+        """Select an action according to the local policy."""
+        pred = self.sess.run(self.ac_copy.actor.output_pred,
+                             feed_dict={self.ac_copy.actor.input_ph: np.reshape(observation, (1, self.input_dim))})
+        return np.random.choice(range(self.output_dim), p=pred.flatten())
+
+    def sample(self):
+        """Samples a single trajectory under the current policy."""
+        transitions = []
+        obs = self.env.reset()
+        total_reward = 0
+        local_steps = 0
+        while local_steps < self.async_update_freq and self.global_count.value < self.max_steps:
+            if self.render:
+                self.env.render()
+
+            action = self.act(obs)
+            new_obs, rew, done, _ = self.env.step(action)
+            total_reward += rew
+
+            transitions.append((obs, action, rew, new_obs, done))
+            self.global_count.value += 1
+            local_steps += 1
+            obs = new_obs
+
+            if done:
+                self.rew_queue.put(total_reward)
+                total_reward = 0
+                obs = self.env.reset()
+
+        return list(map(np.array, zip(*transitions)))
+
+    def update(self, states, action, reward, next_states, done):
+        """Updates the actor and critic networks.
+
+        Args:
+            states: array of states visited
+            action: array of integer ids of selected actions
+            reward: array of rewards received
+            next_states: array of resulting states after taking action
+            done: boolean array denoting if the corresponding state was terminal
+        """
+        # Adjust shapes for batch input to the models
+        action = to_one_hot(action, self.output_dim)
+        reward = reward.reshape(len(reward), 1)
+
+        #######################################################
+        # Update value function network (critic)
+        #######################################################
+        next_state_values = self.gamma * self.sess.run(self.ac.critic.output_pred,
+                                                       feed_dict={self.ac.critic.input_ph: next_states})
+        state_values = self.sess.run(self.ac.critic.output_pred, feed_dict={self.ac.critic.input_ph: states})
+
+        # Adjust the targets for non-terminal states
+        targets = np.copy(reward)
+        loc = np.argwhere(done != True).flatten()
+        if len(loc) > 0:
+            targets[loc] = np.add(
+                targets[loc],
+                next_state_values[loc].reshape(next_state_values[loc].shape[0], 1), casting='unsafe')
+
+        _, value_loss = self.sess.run([self.ac.critic.opt, self.ac.critic.loss],
+                                      feed_dict={self.ac.critic.input_ph: states,
+                                                 self.ac.critic.target_ph: targets})
+
+        #######################################################
+        # Update actor network
+        #######################################################
+        advantage = (reward + self.gamma * next_state_values) - state_values
+        _, policy_loss = self.sess.run([self.ac.opt, self.ac.loss], feed_dict={self.ac.actor.input_ph: states,
+                                                                               self.ac.baseline_ph: advantage,
+                                                                               self.ac.actor.actions_ph: action})
 
 
 class TrainA2C:
-    def __init__(self, num_workers, env_name, max_steps=40000, render=False):
-        self.par_connections, self.child_connections = zip(*[multiprocessing.Pipe() for i in range(num_workers)])
+    def __init__(self,
+                 num_workers,
+                 env_name,
+                 gamma=0.99,
+                 max_steps=40000,
+                 async_update_freq=32,
+                 print_freq=10,
+                 render=False,
+                 save_path=None,
+                 load_path=None):
         self.max_steps = max_steps
+        self.gamma = gamma
         self.render = render
+        self.async_update_freq = async_update_freq
+        self.print_freq = print_freq
         self.num_workers = num_workers
         env = gym.make(env_name)
         self.env_name = env_name
         self.input_dim = env.observation_space.shape[0]
         self.output_dim = env.action_space.n
-        with tf.device("/job:global/task:0"):
-            self.ac = ActorCriticNetworkBuilder(self.input_dim, self.output_dim)
-            self.global_counter = tf.Variable(0, dtype=tf.int32, name='global_counter')
-        self.create_parameter_server()
+        self.par_connections, self.child_connections = zip(*[mp.Pipe() for i in range(num_workers)])
+        self.rew_queue = mp.Queue()
+        self.global_count = mp.Value('i', 0)
+        self.workers = [Worker(
+            worker_id=i,
+            conn=self.child_connections[i],
+            rew_queue=self.rew_queue,
+            env_name=self.env_name,
+            render=self.render,
+            input_dim=self.input_dim,
+            output_dim=self.output_dim,
+            gamma=self.gamma,
+            async_update_freq=self.async_update_freq,
+            max_steps=self.max_steps,
+            global_count=self.global_count) for i in range(self.num_workers)]
+        self.create_config()
+        self.save_path = save_path
+        if load_path is not None:
+            self.ac.actor.saver.restore(self.sess, load_path)
+            self.ac.critic.saver.restore(self.sess, load_path)
+            print(f'Successfully loaded model from {load_path}')
 
-    def create_parameter_server(self):
-        # Create parameter server: http://amid.fish/distributed-tensorflow-a-gentle-introduction
+    def create_config(self):
+        """Creates distributed tensorflow configuration"""
 
         ports = find_open_ports(self.num_workers + 1)
         jobs = {'global': [f'127.0.0.1:{ports[0]}'],
                 'worker': [f'127.0.0.1:{ports[i + 1]}' for i in range(self.num_workers)]}
+        os.environ['TF_CONFIG'] = json.dumps(jobs)
 
-        self.cluster = tf.train.ClusterSpec(jobs)
-        self.server = tf.distribute.Server(self.cluster,
-                                           job_name='global',
-                                           task_index=0)
-        self.workers = [Worker(
-            worker_id=i,
-            # server=worker_servers[i],
-            cluster_config=self.cluster,
-            conn=self.child_connections[i],
-            env_name=self.env_name,
-            render=self.render,
-            input_dim=self.input_dim,
-            output_dim=self.output_dim) for i in range(self.num_workers)]
+        cluster = tf.train.ClusterSpec(jobs)
+        self.server = tf.distribute.Server(cluster, job_name='global', task_index=0)
+        self.sess = tf.Session(target=self.server.target)
+        with tf.variable_scope('global'):
+            self.ac = ActorCriticNetworkBuilder(self.input_dim,
+                                                self.output_dim,
+                                                actor_layers=(32, 32),
+                                                critic_layers=(32, 32),
+                                                actor_activations=(tf.nn.relu, tf.nn.relu, tf.nn.softmax),
+                                                critic_activations=(tf.nn.relu, tf.nn.relu, None))
 
-    def learn(self, sess):
-        # Reset the environ
+    def learn(self):
+        """Trains an agent via advantage actor-critic"""
+        self.sess.run(tf.global_variables_initializer())
+        print('Global: Initialized variables')
         mean_reward = None
-        total_reward = 0
         ep = 0
 
-        for t in range(self.max_steps):
-            pass
-
-    def send_message(self, msg):
-        for conn in self.par_connections:
-            conn.send(msg)
+        while self.global_count.value < self.max_steps:
+            # Print rewards
+            if self.rew_queue.qsize() >= self.print_freq:
+                ep += self.print_freq
+                new_mean_reward = 0
+                for i in range(self.print_freq):
+                    new_mean_reward += self.rew_queue.get()
+                new_mean_reward = new_mean_reward / self.print_freq
+                print(f"-------------------------------------------------------")
+                print(f"Mean {self.print_freq} Episode Reward: {new_mean_reward}")
+                print(f"Total Episodes: {ep}")
+                print(f"Total timesteps: {self.global_count.value}")
+                print(f"-------------------------------------------------------")
 
     def start(self):
-        for w in self.workers:
+        """Starts the worker processes and waits until they are done."""
+        for i, w in enumerate(self.workers):
+            w.daemon = True
             w.start()
-        with tf.Session(target=self.server.target) as sess:
-            sess.run(tf.global_variables_initializer())
-            self.learn(sess)
-            self.send_message(MSG_RESET)
-            self.send_message(MSG_STOP)
+            if i < self.num_workers - 1:
+                # Need to separate workers starting due to resource usage
+                # this can be adjusted for faster/slower machines
+                time.sleep(0.5)
 
+        self.learn()
         for w in self.workers:
             w.join()
-        # sess.close()
+
+        for w in self.workers:
+            w.terminate()
+
+    def save(self):
+        """Saves the actor and critic networks."""
+        self.ac.actor.saver.save(self.sess, self.save_path)
+        self.ac.critic.saver.xsave(self.sess, self.save_path)
+
+    def load(self):
+        """Loads the actor and critic networks."""
+        self.ac.actor.saver.restore(self.sess, self.save_path)
+        self.ac.critic.saver.restore(self.sess, self.save_path)
 
 
 def main():
-    a2c = TrainA2C(1, render=True, env_name='CartPole-v0')
-    a2c.start()
+    # The default method, "fork", copies over the tensorflow module from the parent process
+    #   which is problematic w.r.t GPU resources
+    mp.set_start_method('spawn')
+    t = TrainA2C(4, 'CartPole-v0', max_steps=500000, print_freq=10, async_update_freq=32, render=False)
+    t.start()
 
 
 if __name__ == '__main__':
