@@ -28,12 +28,11 @@ class NetworkBuilder:
         """
         if self.conv:
             input_ph = tf.placeholder(dtype=tf.float32, shape=[None, *self.input_dim])
-            network = tf.image.rgb_to_grayscale(input_ph)
-            network = tf.contrib.layers.conv2d(network, 30, kernel_size=4, activation_fn=tf.nn.relu, stride=4)
-            network = tf.contrib.layers.conv2d(network, 30, kernel_size=2, activation_fn=tf.nn.relu, stride=2)
-            network = tf.contrib.layers.conv2d(network, 30, kernel_size=1, activation_fn=tf.nn.relu, stride=1)
+            network = tf.contrib.layers.conv2d(input_ph, 32, kernel_size=8, activation_fn=tf.nn.relu, stride=4)
+            network = tf.contrib.layers.conv2d(network, 64, kernel_size=4, activation_fn=tf.nn.relu, stride=2)
+            network = tf.contrib.layers.conv2d(network, 64, kernel_size=3, activation_fn=tf.nn.relu, stride=1)
             network = tf.contrib.layers.flatten(network)
-            network = tf.contrib.layers.fully_connected(network, 128, activation_fn=tf.nn.relu)
+            network = tf.contrib.layers.fully_connected(network, 512, activation_fn=tf.nn.relu)
             output_pred = tf.contrib.layers.fully_connected(network, self.output_dim, activation_fn=None)
         else:
             weights = [tf.get_variable(name='W0',

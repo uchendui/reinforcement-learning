@@ -5,10 +5,9 @@ import time
 import json
 import numpy as np
 import multiprocessing as mp
-
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 import tensorflow as tf
 
+os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 sys.path.append('../')
 
 from util.ports import find_open_ports
