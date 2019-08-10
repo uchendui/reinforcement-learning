@@ -5,8 +5,6 @@ import time
 import json
 import numpy as np
 import multiprocessing as mp
-
-# os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 import tensorflow as tf
 
 sys.path.append('../')
@@ -51,6 +49,7 @@ class Worker(mp.Process):
     def create_shared_variables(self):
         """Creates shared variables and a tensorflow server session."""
         config = json.loads(os.environ.get('TF_CONFIG'))
+        gpu_frac = float(os.environ.get('GPU_FRAC'))
         cluster = tf.train.ClusterSpec(config)
         self.server = tf.distribute.Server(cluster, job_name='worker', task_index=self.id)
         with tf.device("/job:global/task:0"):
@@ -59,7 +58,8 @@ class Worker(mp.Process):
                                                 conv=True,
                                                 )
         print(f'Worker {self.id}: Created variables')
-        self.sess = tf.Session(target=self.server.target)
+        gpu_options = tf.GPUOptions(per_process_gpu_memory_fraction=gpu_frac, allow_growth=True)
+        self.sess = tf.Session(config=tf.ConfigProto(gpu_options=gpu_options), target=self.server.target)
         print(f'Worker {self.id}: Session Created')
 
         while len(self.sess.run(tf.report_uninitialized_variables())) > 0:
@@ -121,6 +121,7 @@ class TrainA2C:
         self.par_connections, self.child_connections = zip(*[mp.Pipe() for i in range(num_workers)])
         self.transition_queue = mp.Queue()
         self.rew_queue = mp.Queue()
+        self.num_workers = num_workers
         self.workers = [Worker(
             worker_id=i,
             conn=self.child_connections[i],
@@ -142,11 +143,14 @@ class TrainA2C:
         ports = find_open_ports(self.num_workers + 1)
         jobs = {'global': [f'127.0.0.1:{ports[0]}'],
                 'worker': [f'127.0.0.1:{ports[i + 1]}' for i in range(self.num_workers)]}
+        gpu_frac = 1 / (self.num_workers + 1)
         os.environ['TF_CONFIG'] = json.dumps(jobs)
-
+        os.environ['GPU_FRAC'] = str(gpu_frac)
         cluster = tf.train.ClusterSpec(jobs)
         self.server = tf.distribute.Server(cluster, job_name='global', task_index=0)
-        self.sess = tf.Session(target=self.server.target)
+        # .gpu_options.allow_growth = True
+        gpu_options = tf.GPUOptions(per_process_gpu_memory_fraction=gpu_frac, allow_growth=True)
+        self.sess = tf.Session(config=tf.ConfigProto(gpu_options=gpu_options), target=self.server.target)
         with tf.device("/job:global/task:0"):
             self.ac = ActorCriticNetworkBuilder(self.input_dim,
                                                 self.output_dim,
