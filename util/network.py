@@ -68,7 +68,6 @@ class NetworkBuilder:
                     layer = activation(layer)
             output_pred = layer
 
-        self.saver = tf.train.Saver()
         return input_ph, output_pred
 
 
@@ -92,6 +91,8 @@ class QNetworkBuilder(NetworkBuilder):
         self.adam = tf.train.AdamOptimizer(learning_rate=learning_rate)
         self.opt = self.adam.minimize(self.loss)
 
+        self.saver = tf.train.Saver()
+
 
 class ValueNetworkBuilder(NetworkBuilder):
     def __init__(self, input_dim, layers=(512,), activations=(tf.nn.relu, None),
@@ -109,6 +110,8 @@ class ValueNetworkBuilder(NetworkBuilder):
         # Optimizer
         self.adam = tf.train.AdamOptimizer(learning_rate=learning_rate)
         self.opt = self.adam.minimize(self.loss)
+
+        self.saver = tf.train.Saver()
 
 
 class PolicyNetworkBuilder(NetworkBuilder):
@@ -133,6 +136,8 @@ class PolicyNetworkBuilder(NetworkBuilder):
         self.adam = tf.train.AdamOptimizer(learning_rate=learning_rate)
         self.opt = self.adam.minimize(self.loss)
 
+        self.saver = tf.train.Saver()
+
 
 class ActorCriticNetworkBuilder:
     """Creates a network for A2C and A3C and defines ops"""
@@ -154,6 +159,8 @@ class ActorCriticNetworkBuilder:
                                               activations=critic_activations,  # Value function needs linear output
                                               conv=conv,
                                               learning_rate=critic_lr)
+
+        self.saver = tf.train.Saver()
 
 
 def main():

@@ -23,6 +23,7 @@ class TrainDQN:
                  print_freq=20,
                  load_path=None,
                  save_path=None,
+                 log_dir='logs/train',
                  max_steps=100000,
                  buffer_capacity=None,
                  max_episode_len=2000,
@@ -80,6 +81,15 @@ class TrainDQN:
             self.q_network.saver.restore(sess, load_path)
             print(f'Successfully loaded model from {load_path}')
 
+        self.add_summaries(log_dir)
+
+    def add_summaries(self, log_dir):
+        tf.summary.scalar('Loss', self.q_network.loss, )
+        tf.summary.scalar('Mean Estimated Value', tf.reduce_mean(self.q_network.output_pred))
+        # Merge all the summaries and write them out to log_dir
+        self.merged = tf.summary.merge_all()
+        self.train_writer = tf.summary.FileWriter(log_dir, self.sess.graph)
+
     def learn(self):
         """Learns via Deep-Q-Networks (DQN)"""
         obs = self.env.reset()
@@ -135,6 +145,13 @@ class TrainDQN:
                     print(f"Total timesteps: {t}")
                     print(f"-------------------------------------------------------")
 
+                    # Add reward summary
+                    summary = tf.Summary()
+                    summary.value.add(tag=f'Mean {self.print_freq} Episode Reward',
+                                      simple_value=new_mean_reward)
+                    summary.value.add(tag=f'Epsilon', simple_value=eps)
+                    self.train_writer.add_summary(summary, self.num_updates)
+                    
                     # Model saving inspired by Open AI Baseline implementation
                     if (mean_reward is None or new_mean_reward >= mean_reward) and self.save_path is not None:
                         print(f"Saving model due to mean reward increase:{mean_reward} -> {new_mean_reward}")
@@ -216,7 +233,13 @@ def main():
     with tf.Session() as sess:
         env_name = 'CartPole-v0'
         env = gym.make(env_name)
-        dqn = TrainDQN(env, sess, print_freq=10, target_update_fraction=0.01, render=False, max_steps=40000,
+        dqn = TrainDQN(env,
+                       sess,
+                       print_freq=10,
+                       target_update_fraction=0.01,
+                       render=False,
+                       max_steps=40000,
+                       log_dir=f'logs/{env_name}',
                        save_path=f'checkpoints/{env_name}.ckpt')
         sess.run(tf.initialize_all_variables())
         dqn.learn()
