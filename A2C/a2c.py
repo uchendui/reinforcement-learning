@@ -207,7 +207,7 @@ class TrainA2C:
         #######################################################
         # Update actor network
         #######################################################
-        advantage = (reward + self.gamma * next_state_values) - state_values
+        advantage = (reward + next_state_values) - state_values
         _, policy_loss = self.sess.run([self.ac.actor.opt, self.ac.actor.loss],
                                        feed_dict={self.ac.actor.input_ph: states,
                                                   self.ac.actor.baseline_ph: advantage.flatten(),

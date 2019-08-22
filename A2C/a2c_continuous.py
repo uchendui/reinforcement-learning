@@ -7,16 +7,53 @@ import numpy as np
 import multiprocessing as mp
 import tensorflow as tf
 
+# import tensorflow_probability as tfp
+
 os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 sys.path.append('../')
 
 from util.ports import find_open_ports
-from util.network import ActorCriticNetworkBuilder
 from util.misc import to_one_hot
 
 MSG_STOP = 'stop'
 MSG_STEP = 'step'
 MSG_RESET = 'reset'
+
+
+class ContinuousActorCriticNetworkBuilder:
+    def __init__(self, in_dim, out_dim):
+        self.in_ph = tf.placeholder(dtype=tf.float32, shape=[None, in_dim], name="Input")
+
+        with tf.variable_scope('actor'):
+            self.baseline_ph = tf.placeholder(dtype=tf.float32, shape=[None, 1], name='Baseline')
+            self.actions_ph = tf.placeholder(dtype=tf.float32, shape=[None, out_dim], name='actions')
+            actor = tf.contrib.layers.fully_connected(self.in_ph, 32, activation_fn=tf.nn.relu)
+            actor = tf.contrib.layers.fully_connected(actor, 32, activation_fn=tf.nn.relu)
+            self.mean = tf.contrib.layers.fully_connected(actor, out_dim, activation_fn=tf.nn.tanh)
+            self.var = tf.contrib.layers.fully_connected(actor, out_dim, activation_fn=tf.nn.softplus)
+
+            # Create distribution for continuous actions
+            self.distribution = tf.distributions.Normal(self.mean, tf.sqrt(self.var))
+            self.sample = self.distribution.sample(out_dim)
+            self.sample = tf.clip_by_value(self.sample, -2, 2)
+            self.actor_loss = tf.reduce_mean(- self.distribution.log_prob(self.actions_ph) * self.baseline_ph)
+
+        with tf.variable_scope('critic'):
+            self.target_ph = tf.placeholder(dtype=tf.float32, shape=[None, 1])
+            critic = tf.contrib.layers.fully_connected(self.in_ph, 32, activation_fn=tf.nn.relu)
+            critic = tf.contrib.layers.fully_connected(critic, 32, activation_fn=tf.nn.relu)
+            self.value = tf.contrib.layers.fully_connected(critic, 1, activation_fn=None)
+
+            # Create loss
+            self.critic_loss = tf.losses.mean_squared_error(self.value, self.target_ph)
+
+        # Optimizer
+        self.loss = self.critic_loss + self.actor_loss
+        self.opt = tf.train.AdamOptimizer().minimize(self.loss)
+        self.saver = tf.train.Saver()
+
+    def log_prob(self, mean, var, x):
+        return -(tf.divide(tf.square(x - mean), 2 * var) + tf.log(tf.sqrt(2 * np.pi * var)))
 
 
 class Worker(mp.Process):
@@ -28,16 +65,12 @@ class Worker(mp.Process):
                  env_name,
                  input_dim,
                  output_dim,
-                 actor_lr,
-                 critic_lr,
                  render):
         super(Worker, self).__init__()
         self.id = worker_id
         self.env = gym.make(env_name)
         self.input_dim = input_dim
         self.output_dim = output_dim
-        self.actor_lr = actor_lr
-        self.critic_lr = critic_lr
         self.render = render
         self.conn = conn
         self.exp_queue = exp_queue
@@ -47,6 +80,7 @@ class Worker(mp.Process):
 
     def run(self):
         """This method is called once a 'Worker' process is started."""
+        os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
         self.create_shared_variables()
         self.listen_for_commands()
 
@@ -56,12 +90,7 @@ class Worker(mp.Process):
         cluster = tf.train.ClusterSpec(config)
         self.server = tf.distribute.Server(cluster, job_name='worker', task_index=self.id)
         with tf.device("/job:global/task:0"):
-            self.ac = ActorCriticNetworkBuilder(self.input_dim,
-                                                self.output_dim,
-                                                actor_lr=self.actor_lr,
-                                                critic_lr=self.critic_lr,
-                                                conv=True,
-                                                )
+            self.ac = ContinuousActorCriticNetworkBuilder(self.input_dim, self.output_dim, )
         print(f'Worker {self.id}: Created variables')
         self.sess = tf.Session(target=self.server.target)
         print(f'Worker {self.id}: Session Created')
@@ -84,9 +113,10 @@ class Worker(mp.Process):
 
     def act(self, observation):
         """Select an action according to the policy."""
-        pred = self.sess.run(self.ac.actor.output_pred,
-                             feed_dict={self.ac.actor.input_ph: np.expand_dims(observation, axis=0)})
-        return np.random.choice(range(self.output_dim), p=pred.flatten())
+
+        sample, mean, var = self.sess.run([self.ac.sample, self.ac.mean, self.ac.var],
+                                          feed_dict={self.ac.in_ph: np.reshape(observation, (1, self.input_dim))})
+        return sample
 
     def step(self):
         """Performs a single step of the environment and adds a transition to the experience queue."""
@@ -94,6 +124,8 @@ class Worker(mp.Process):
             self.env.render()
         action = self.act(self.obs)
         obs, rew, done, _ = self.env.step(action)
+        obs = obs.reshape(self.obs.shape)
+        rew = np.array(rew).item()
         self.episode_reward += rew
         self.exp_queue.put((self.obs, action, rew, obs, done))
         self.obs = obs
@@ -108,69 +140,51 @@ class TrainA2C:
                  num_workers,
                  env_name,
                  gamma=0.99,
-                 actor_lr=0.0001,
-                 critic_lr=0.001,
                  max_steps=40000,
                  print_freq=10,
                  render=False,
                  save_path=None,
-                 load_path=None,
-                 sess=None):
+                 load_path=None):
         self.max_steps = max_steps
         self.gamma = gamma
-        self.actor_lr = actor_lr
-        self.critic_lr = critic_lr
         self.render = render
         self.print_freq = print_freq
         self.num_workers = num_workers
         env = gym.make(env_name)
         self.env_name = env_name
-        self.input_dim = env.observation_space.shape
-        self.output_dim = env.action_space.n
-
-        if sess is None:
-            self.par_connections, self.child_connections = zip(*[mp.Pipe() for i in range(num_workers)])
-            self.transition_queue = mp.Queue()
-            self.rew_queue = mp.Queue()
-            self.num_workers = num_workers
-            self.workers = [Worker(
-                worker_id=i,
-                conn=self.child_connections[i],
-                exp_queue=self.transition_queue,
-                rew_queue=self.rew_queue,
-                env_name=self.env_name,
-                render=self.render,
-                input_dim=self.input_dim,
-                output_dim=self.output_dim,
-                actor_lr=self.actor_lr,
-                critic_lr=self.critic_lr) for i in range(self.num_workers)]
-            self.create_config()
-        else:
-            self.sess = sess
-            self.ac = ActorCriticNetworkBuilder(self.input_dim,
-                                                self.output_dim,
-                                                conv=True)
+        self.input_dim = env.observation_space.shape[0]
+        self.output_dim = env.action_space.shape[0]
+        self.par_connections, self.child_connections = zip(*[mp.Pipe() for i in range(num_workers)])
+        self.transition_queue = mp.Queue()
+        self.rew_queue = mp.Queue()
+        self.workers = [Worker(
+            worker_id=i,
+            conn=self.child_connections[i],
+            exp_queue=self.transition_queue,
+            rew_queue=self.rew_queue,
+            env_name=self.env_name,
+            render=self.render,
+            input_dim=self.input_dim,
+            output_dim=self.output_dim) for i in range(self.num_workers)]
+        self.create_config()
         self.save_path = save_path
-
         if load_path is not None:
             self.ac.saver.restore(self.sess, load_path)
             print(f'Successfully loaded model from {load_path}')
 
     def create_config(self):
         """Creates distributed tensorflow configuration"""
+
         ports = find_open_ports(self.num_workers + 1)
         jobs = {'global': [f'127.0.0.1:{ports[0]}'],
                 'worker': [f'127.0.0.1:{ports[i + 1]}' for i in range(self.num_workers)]}
         os.environ['TF_CONFIG'] = json.dumps(jobs)
+
         cluster = tf.train.ClusterSpec(jobs)
         self.server = tf.distribute.Server(cluster, job_name='global', task_index=0)
         self.sess = tf.Session(target=self.server.target)
         with tf.device("/job:global/task:0"):
-            self.ac = ActorCriticNetworkBuilder(self.input_dim,
-                                                self.output_dim,
-                                                actor_lr=self.actor_lr,
-                                                critic_lr=self.critic_lr,
-                                                conv=True)
+            self.ac = ContinuousActorCriticNetworkBuilder(self.input_dim, self.output_dim, )
 
     def get_transitions(self):
         """Waits for every worker to sample the environment.
@@ -197,15 +211,10 @@ class TrainA2C:
             done: boolean array denoting if the corresponding state was terminal
         """
         # Adjust shapes for batch input to the models
-        action = to_one_hot(action, self.output_dim)
         reward = reward.reshape(len(reward), 1)
-
-        #######################################################
-        # Update value function network (critic)
-        #######################################################
-        next_state_values = self.gamma * self.sess.run(self.ac.critic.output_pred,
-                                                       feed_dict={self.ac.critic.input_ph: next_states})
-        state_values = self.sess.run(self.ac.critic.output_pred, feed_dict={self.ac.critic.input_ph: states})
+        action = action.reshape(len(action), 1)
+        next_state_values = self.gamma * self.sess.run(self.ac.value, feed_dict={self.ac.in_ph: next_states})
+        state_values = self.sess.run(self.ac.value, feed_dict={self.ac.in_ph: states})
 
         # Adjust the targets for non-terminal states
         targets = np.copy(reward)
@@ -215,18 +224,13 @@ class TrainA2C:
                 targets[loc],
                 next_state_values[loc].reshape(next_state_values[loc].shape[0], 1), casting='unsafe')
 
-        _, value_loss = self.sess.run([self.ac.critic.opt, self.ac.critic.loss],
-                                      feed_dict={self.ac.critic.input_ph: states,
-                                                 self.ac.critic.target_ph: targets})
-
-        #######################################################
-        # Update actor network
-        #######################################################
         advantage = (reward + next_state_values) - state_values
-        _, policy_loss = self.sess.run([self.ac.actor.opt, self.ac.actor.loss],
-                                       feed_dict={self.ac.actor.input_ph: states,
-                                                  self.ac.actor.baseline_ph: advantage.flatten(),
-                                                  self.ac.actor.actions_ph: action})
+
+        _, value_loss, policy_loss = self.sess.run([self.ac.opt, self.ac.critic_loss, self.ac.actor_loss],
+                                                   feed_dict={self.ac.in_ph: states,
+                                                              self.ac.target_ph: targets,
+                                                              self.ac.baseline_ph: advantage,
+                                                              self.ac.actions_ph: action})
 
     def learn(self):
         """Trains an agent via advantage actor-critic"""
@@ -300,13 +304,12 @@ def main():
     # The default method, "fork", copies over the tensorflow module from the parent process
     #   which is problematic w.r.t GPU resources
     mp.set_start_method('spawn')
-    env_name = 'CubeCrash-v0'
-    t = TrainA2C(4,
-                 env_name,
+    env_name = 'Pendulum-v0'
+    # env_name = 'MountainCarContinuous-v0'
+
+    t = TrainA2C(4, env_name,
                  max_steps=100000,
-                 print_freq=100,
-                 actor_lr=0.00005,
-                 critic_lr=0.001,
+                 print_freq=5,
                  save_path=f'checkpoints/{env_name}.ckpt',
                  render=False)
     t.start()

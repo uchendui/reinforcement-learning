@@ -143,7 +143,7 @@ class ActorCriticNetworkBuilder:
 
     def __init__(self, input_dim, output_dim, actor_layers=(512,), critic_layers=(512,),
                  actor_activations=(tf.nn.relu, tf.nn.softmax),
-                 critic_activations=(tf.nn.relu, None), conv=False, actor_lr=0.0001, critic_lr=0.001):
+                 critic_activations=(tf.nn.relu, None), conv=False, continuous=False, actor_lr=0.0001, critic_lr=0.001):
         # Create two networks: one for the policy and one for the value function
         with tf.variable_scope('actor'):
             self.actor = PolicyNetworkBuilder(input_dim=input_dim,
@@ -160,6 +160,7 @@ class ActorCriticNetworkBuilder:
                                               learning_rate=critic_lr)
 
         self.saver = tf.train.Saver()
+
 
 
 def main():
