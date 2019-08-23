@@ -21,7 +21,8 @@ MSG_RESET = 'reset'
 
 
 class ContinuousActorCriticNetworkBuilder:
-    def __init__(self, in_dim, out_dim):
+    def __init__(self, in_dim, out_dim, actor_lr=0.00005,
+                 critic_lr=0.001, ):
         self.in_ph = tf.placeholder(dtype=tf.float32, shape=[None, in_dim], name="Input")
 
         with tf.variable_scope('actor'):
@@ -37,6 +38,7 @@ class ContinuousActorCriticNetworkBuilder:
             self.sample = self.distribution.sample(out_dim)
             self.sample = tf.clip_by_value(self.sample, -2, 2)
             self.actor_loss = tf.reduce_mean(- self.distribution.log_prob(self.actions_ph) * self.baseline_ph)
+            self.act_opt = tf.train.AdamOptimizer(learning_rate=actor_lr).minimize(self.actor_loss)
 
         with tf.variable_scope('critic'):
             self.target_ph = tf.placeholder(dtype=tf.float32, shape=[None, 1])
@@ -47,9 +49,9 @@ class ContinuousActorCriticNetworkBuilder:
             # Create loss
             self.critic_loss = tf.losses.mean_squared_error(self.value, self.target_ph)
 
-        # Optimizer
-        self.loss = self.critic_loss + self.actor_loss
-        self.opt = tf.train.AdamOptimizer().minimize(self.loss)
+            # Optimizer
+            self.crit_opt = tf.train.AdamOptimizer(learning_rate=critic_lr).minimize(self.critic_loss)
+
         self.saver = tf.train.Saver()
 
     def log_prob(self, mean, var, x):
@@ -123,6 +125,7 @@ class Worker(mp.Process):
         if self.render:
             self.env.render()
         action = self.act(self.obs)
+        # print('Action: ', action)
         obs, rew, done, _ = self.env.step(action)
         obs = obs.reshape(self.obs.shape)
         rew = np.array(rew).item()
@@ -144,7 +147,9 @@ class TrainA2C:
                  print_freq=10,
                  render=False,
                  save_path=None,
-                 load_path=None):
+                 load_path=None,
+                 log_dir='logs/train',
+                 ):
         self.max_steps = max_steps
         self.gamma = gamma
         self.render = render
@@ -171,6 +176,7 @@ class TrainA2C:
         if load_path is not None:
             self.ac.saver.restore(self.sess, load_path)
             print(f'Successfully loaded model from {load_path}')
+        self.add_summaries(log_dir)
 
     def create_config(self):
         """Creates distributed tensorflow configuration"""
@@ -186,6 +192,15 @@ class TrainA2C:
         with tf.device("/job:global/task:0"):
             self.ac = ContinuousActorCriticNetworkBuilder(self.input_dim, self.output_dim, )
 
+    def add_summaries(self, log_dir):
+        tf.summary.scalar('Value Loss', self.ac.critic_loss, )
+        tf.summary.scalar('Actor Loss', self.ac.actor_loss, )
+        tf.summary.scalar('Mean Estimated Value', tf.reduce_mean(self.ac.value))
+
+        # Merge all the summaries and write them out to log_dir
+        self.merged = tf.summary.merge_all()
+        self.train_writer = tf.summary.FileWriter(log_dir, self.sess.graph)
+
     def get_transitions(self):
         """Waits for every worker to sample the environment.
 
@@ -200,7 +215,7 @@ class TrainA2C:
 
         return list(map(np.array, zip(*samples)))
 
-    def update(self, states, action, reward, next_states, done):
+    def update(self, num_update, states, action, reward, next_states, done):
         """Updates the actor and critic networks.
 
         Args:
@@ -224,13 +239,21 @@ class TrainA2C:
                 targets[loc],
                 next_state_values[loc].reshape(next_state_values[loc].shape[0], 1), casting='unsafe')
 
+        # Update critic network
+        _, value_loss = self.sess.run([self.ac.crit_opt, self.ac.critic_loss],
+                                      feed_dict={self.ac.in_ph: states,
+                                                 self.ac.target_ph: targets,
+                                                 })
+        # Update actor network
         advantage = (reward + next_state_values) - state_values
+        _, policy_loss, summary = self.sess.run([self.ac.act_opt, self.ac.actor_loss, self.merged],
+                                                feed_dict={self.ac.in_ph: states,
+                                                           self.ac.target_ph: targets,
+                                                           self.ac.baseline_ph: advantage,
+                                                           self.ac.actions_ph: action})
 
-        _, value_loss, policy_loss = self.sess.run([self.ac.opt, self.ac.critic_loss, self.ac.actor_loss],
-                                                   feed_dict={self.ac.in_ph: states,
-                                                              self.ac.target_ph: targets,
-                                                              self.ac.baseline_ph: advantage,
-                                                              self.ac.actions_ph: action})
+        # Write summaries
+        self.train_writer.add_summary(summary, num_update)
 
     def learn(self):
         """Trains an agent via advantage actor-critic"""
@@ -245,7 +268,7 @@ class TrainA2C:
             batch = self.get_transitions()
 
             # Update the actor and critic models
-            self.update(*batch)
+            self.update(t, *batch)
 
             # Print rewards
             if self.rew_queue.qsize() >= self.print_freq:
@@ -254,10 +277,12 @@ class TrainA2C:
                 for i in range(self.print_freq):
                     new_mean_reward += self.rew_queue.get()
                 new_mean_reward = new_mean_reward / self.print_freq
+                total_steps = (t + 1) * self.num_workers
+
                 print(f"-------------------------------------------------------")
                 print(f"Mean {self.print_freq} Episode Reward: {new_mean_reward}")
                 print(f"Total Episodes: {ep}")
-                print(f"Total timesteps: {(t + 1) * self.num_workers}")
+                print(f"Total timesteps: {total_steps}")
                 print(f"-------------------------------------------------------")
 
                 if (mean_reward is None or new_mean_reward >= mean_reward) and self.save_path is not None:
@@ -265,6 +290,12 @@ class TrainA2C:
                     print(f'Location: {self.save_path}')
                     self.save()
                     mean_reward = new_mean_reward
+
+                # Add reward summary
+                summary = tf.Summary()
+                summary.value.add(tag=f'Mean {self.print_freq} Episode Reward',
+                                  simple_value=new_mean_reward)
+                self.train_writer.add_summary(summary, total_steps)
 
         self.send_message(MSG_STOP)
 
@@ -307,9 +338,11 @@ def main():
     env_name = 'Pendulum-v0'
     # env_name = 'MountainCarContinuous-v0'
 
-    t = TrainA2C(4, env_name,
+    t = TrainA2C(6,
+                 env_name,
                  max_steps=100000,
                  print_freq=5,
+                 log_dir=f'logs/',
                  save_path=f'checkpoints/{env_name}.ckpt',
                  render=False)
     t.start()
