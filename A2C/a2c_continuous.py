@@ -3,26 +3,42 @@ import gym
 import sys
 import time
 import json
+import click
 import numpy as np
 import multiprocessing as mp
 import tensorflow as tf
-
-# import tensorflow_probability as tfp
 
 os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 sys.path.append('../')
 
 from util.ports import find_open_ports
 from util.misc import to_one_hot
+from tensorflow.python.platform import flags
 
 MSG_STOP = 'stop'
 MSG_STEP = 'step'
 MSG_RESET = 'reset'
 
+FLAGS = flags.FLAGS
+flags.DEFINE_string('env_name', 'Pendulum-v0', 'Environment name')
+flags.DEFINE_integer('num_workers', 1, 'Number of parallel workers')
+flags.DEFINE_float('actor_lr', 0.00005, 'Actor network learning rate')
+flags.DEFINE_float('critic_lr', 0.001, 'Critic network learning rate')
+flags.DEFINE_string('save_path', None, 'Save location for the model')
+flags.DEFINE_string('load_path', None, 'Load location for the model')
+flags.DEFINE_string('log_path', 'logs/', 'Location to store Tensorboard logs')
+flags.DEFINE_integer('print_freq', 1, 'Number of episodes between printing statistics')
+flags.DEFINE_integer('max_steps', 100000, 'Maximum number of environment steps')
+flags.DEFINE_boolean('render', False, 'Render the environment during training')
+
 
 class ContinuousActorCriticNetworkBuilder:
-    def __init__(self, in_dim, out_dim, actor_lr=0.00005,
-                 critic_lr=0.001, ):
+    def __init__(self,
+                 in_dim,
+                 out_dim,
+                 actor_lr=0.001,
+                 critic_lr=0.00005,
+                 entropy_strength=0.01):
         self.in_ph = tf.placeholder(dtype=tf.float32, shape=[None, in_dim], name="Input")
 
         with tf.variable_scope('actor'):
@@ -37,7 +53,11 @@ class ContinuousActorCriticNetworkBuilder:
             self.distribution = tf.distributions.Normal(self.mean, tf.sqrt(self.var))
             self.sample = self.distribution.sample(out_dim)
             self.sample = tf.clip_by_value(self.sample, -2, 2)
-            self.actor_loss = tf.reduce_mean(- self.distribution.log_prob(self.actions_ph) * self.baseline_ph)
+
+            # self.entropy = entropy_strength * self.distribution.entropy()
+            # Maximize entropy, so we subtract it from the loss function
+            self.actor_loss = tf.reduce_mean(
+                - self.distribution.log_prob(self.actions_ph) * self.baseline_ph)
             self.act_opt = tf.train.AdamOptimizer(learning_rate=actor_lr).minimize(self.actor_loss)
 
         with tf.variable_scope('critic'):
@@ -149,6 +169,8 @@ class TrainA2C:
                  save_path=None,
                  load_path=None,
                  log_dir='logs/train',
+                 actor_lr=0.00005,
+                 critic_lr=0.001,
                  ):
         self.max_steps = max_steps
         self.gamma = gamma
@@ -159,6 +181,8 @@ class TrainA2C:
         self.env_name = env_name
         self.input_dim = env.observation_space.shape[0]
         self.output_dim = env.action_space.shape[0]
+        self.actor_lr = actor_lr
+        self.critic_lr = critic_lr
         self.par_connections, self.child_connections = zip(*[mp.Pipe() for i in range(num_workers)])
         self.transition_queue = mp.Queue()
         self.rew_queue = mp.Queue()
@@ -189,8 +213,10 @@ class TrainA2C:
         cluster = tf.train.ClusterSpec(jobs)
         self.server = tf.distribute.Server(cluster, job_name='global', task_index=0)
         self.sess = tf.Session(target=self.server.target)
+
         with tf.device("/job:global/task:0"):
-            self.ac = ContinuousActorCriticNetworkBuilder(self.input_dim, self.output_dim, )
+            self.ac = ContinuousActorCriticNetworkBuilder(self.input_dim, self.output_dim, actor_lr=self.actor_lr,
+                                                          critic_lr=self.critic_lr)
 
     def add_summaries(self, log_dir):
         tf.summary.scalar('Value Loss', self.ac.critic_loss, )
@@ -335,16 +361,18 @@ def main():
     # The default method, "fork", copies over the tensorflow module from the parent process
     #   which is problematic w.r.t GPU resources
     mp.set_start_method('spawn')
-    env_name = 'Pendulum-v0'
-    # env_name = 'MountainCarContinuous-v0'
-
-    t = TrainA2C(6,
-                 env_name,
-                 max_steps=100000,
-                 print_freq=5,
-                 log_dir=f'logs/',
-                 save_path=f'checkpoints/{env_name}.ckpt',
-                 render=False)
+    save_path = f'checkpoints/{FLAGS.env_name}.ckpt' if FLAGS.save_path is None else FLAGS.save_path
+    log_dir = f'logs/{FLAGS.env_name}' if FLAGS.log_path is None else FLAGS.log_path
+    t = TrainA2C(num_workers=FLAGS.num_workers,
+                 env_name=FLAGS.env_name,
+                 actor_lr=FLAGS.actor_lr,
+                 critic_lr=FLAGS.critic_lr,
+                 max_steps=FLAGS.max_steps,
+                 print_freq=FLAGS.print_freq,
+                 render=FLAGS.render,
+                 log_dir=log_dir,
+                 save_path=save_path,
+                 load_path=FLAGS.load_path)
     t.start()
 
 
