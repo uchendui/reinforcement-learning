@@ -3,7 +3,6 @@ import gym
 import sys
 import time
 import json
-import click
 import numpy as np
 import multiprocessing as mp
 import tensorflow as tf
@@ -20,14 +19,14 @@ MSG_STEP = 'step'
 MSG_RESET = 'reset'
 
 FLAGS = flags.FLAGS
-flags.DEFINE_string('env_name', 'Pendulum-v0', 'Environment name')
-flags.DEFINE_integer('num_workers', 1, 'Number of parallel workers')
+flags.DEFINE_string('env_name', 'MountainCarContinuous-v0', 'Environment name')
+flags.DEFINE_integer('num_workers', 8, 'Number of parallel workers')
 flags.DEFINE_float('actor_lr', 0.00005, 'Actor network learning rate')
-flags.DEFINE_float('critic_lr', 0.001, 'Critic network learning rate')
+flags.DEFINE_float('critic_lr', 0.0001, 'Critic network learning rate')
 flags.DEFINE_string('save_path', None, 'Save location for the model')
 flags.DEFINE_string('load_path', None, 'Load location for the model')
 flags.DEFINE_string('log_path', 'logs/', 'Location to store Tensorboard logs')
-flags.DEFINE_integer('print_freq', 1, 'Number of episodes between printing statistics')
+flags.DEFINE_integer('print_freq', 5, 'Number of episodes between printing statistics')
 flags.DEFINE_integer('max_steps', 100000, 'Maximum number of environment steps')
 flags.DEFINE_boolean('render', False, 'Render the environment during training')
 
@@ -38,26 +37,30 @@ class ContinuousActorCriticNetworkBuilder:
                  out_dim,
                  actor_lr=0.001,
                  critic_lr=0.00005,
-                 entropy_strength=0.01):
+                 entropy_strength=0.1):
         self.in_ph = tf.placeholder(dtype=tf.float32, shape=[None, in_dim], name="Input")
 
         with tf.variable_scope('actor'):
             self.baseline_ph = tf.placeholder(dtype=tf.float32, shape=[None, 1], name='Baseline')
             self.actions_ph = tf.placeholder(dtype=tf.float32, shape=[None, out_dim], name='actions')
-            actor = tf.contrib.layers.fully_connected(self.in_ph, 32, activation_fn=tf.nn.relu)
-            actor = tf.contrib.layers.fully_connected(actor, 32, activation_fn=tf.nn.relu)
-            self.mean = tf.contrib.layers.fully_connected(actor, out_dim, activation_fn=tf.nn.tanh)
-            self.var = tf.contrib.layers.fully_connected(actor, out_dim, activation_fn=tf.nn.softplus)
+            actor = tf.contrib.layers.fully_connected(self.in_ph, 32, activation_fn=tf.nn.leaky_relu)
+            actor = tf.contrib.layers.fully_connected(actor, 32, activation_fn=tf.nn.leaky_relu)
+            self.mean = tf.contrib.layers.fully_connected(actor, out_dim, activation_fn=None)
+            self.sigma = tf.contrib.layers.fully_connected(actor, out_dim, activation_fn=None)
+            self.sigma = tf.nn.softplus(self.sigma) + 1e-5
 
             # Create distribution for continuous actions
-            self.distribution = tf.distributions.Normal(self.mean, tf.sqrt(self.var))
+            self.distribution = tf.distributions.Normal(self.mean, self.sigma)
             self.sample = self.distribution.sample(out_dim)
-            self.sample = tf.clip_by_value(self.sample, -2, 2)
+            self.sample = tf.clip_by_value(self.sample, -1, 1)
 
-            # self.entropy = entropy_strength * self.distribution.entropy()
+            self.entropy = entropy_strength * self.distribution.entropy()
             # Maximize entropy, so we subtract it from the loss function
-            self.actor_loss = tf.reduce_mean(
-                - self.distribution.log_prob(self.actions_ph) * self.baseline_ph)
+            # self.actor_loss = tf.reduce_mean(
+            #     - self.distribution.log_prob(self.actions_ph) * self.baseline_ph - self.entropy)
+            self.actor_loss = -self.distribution.log_prob(self.actions_ph) * self.baseline_ph - self.entropy
+            self.actor_loss = tf.reduce_mean(self.actor_loss)
+            # self.actor_loss = -tf.log(self.distribution.prob(self.actions_ph) + 1e-5) * self.baseline_ph - self.entropy
             self.act_opt = tf.train.AdamOptimizer(learning_rate=actor_lr).minimize(self.actor_loss)
 
         with tf.variable_scope('critic'):
@@ -136,8 +139,8 @@ class Worker(mp.Process):
     def act(self, observation):
         """Select an action according to the policy."""
 
-        sample, mean, var = self.sess.run([self.ac.sample, self.ac.mean, self.ac.var],
-                                          feed_dict={self.ac.in_ph: np.reshape(observation, (1, self.input_dim))})
+        sample, mean, sigma = self.sess.run([self.ac.sample, self.ac.mean, self.ac.sigma],
+                                            feed_dict={self.ac.in_ph: np.reshape(observation, (1, self.input_dim))})
         return sample
 
     def step(self):
@@ -273,6 +276,7 @@ class TrainA2C:
         # Update actor network
         advantage = (reward + next_state_values) - state_values
         _, policy_loss, summary = self.sess.run([self.ac.act_opt, self.ac.actor_loss, self.merged],
+                                                # _, policy_loss = self.sess.run([self.ac.act_opt, self.ac.actor_loss, ],
                                                 feed_dict={self.ac.in_ph: states,
                                                            self.ac.target_ph: targets,
                                                            self.ac.baseline_ph: advantage,
