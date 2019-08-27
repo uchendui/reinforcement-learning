@@ -23,6 +23,7 @@ flags.DEFINE_string('env_name', 'MountainCarContinuous-v0', 'Environment name')
 flags.DEFINE_integer('num_workers', 8, 'Number of parallel workers')
 flags.DEFINE_float('actor_lr', 0.00005, 'Actor network learning rate')
 flags.DEFINE_float('critic_lr', 0.0001, 'Critic network learning rate')
+flags.DEFINE_float('entropy', 0.05, 'Entropy coefficient')
 flags.DEFINE_string('save_path', None, 'Save location for the model')
 flags.DEFINE_string('load_path', None, 'Load location for the model')
 flags.DEFINE_string('log_path', 'logs/', 'Location to store Tensorboard logs')
@@ -90,12 +91,18 @@ class Worker(mp.Process):
                  env_name,
                  input_dim,
                  output_dim,
+                 actor_lr,
+                 critic_lr,
+                 entropy_strength,
                  render):
         super(Worker, self).__init__()
         self.id = worker_id
         self.env = gym.make(env_name)
         self.input_dim = input_dim
         self.output_dim = output_dim
+        self.actor_lr = actor_lr
+        self.critic_lr = critic_lr
+        self.entropy = entropy_strength
         self.render = render
         self.conn = conn
         self.exp_queue = exp_queue
@@ -115,7 +122,8 @@ class Worker(mp.Process):
         cluster = tf.train.ClusterSpec(config)
         self.server = tf.distribute.Server(cluster, job_name='worker', task_index=self.id)
         with tf.device("/job:global/task:0"):
-            self.ac = ContinuousActorCriticNetworkBuilder(self.input_dim, self.output_dim, )
+            self.ac = ContinuousActorCriticNetworkBuilder(self.input_dim, self.output_dim, actor_lr=self.actor_lr,
+                                                          critic_lr=self.critic_lr, entropy_strength=self.entropy)
         print(f'Worker {self.id}: Created variables')
         self.sess = tf.Session(target=self.server.target)
         print(f'Worker {self.id}: Session Created')
@@ -167,6 +175,7 @@ class TrainA2C:
                  env_name,
                  gamma=0.99,
                  max_steps=40000,
+                 entropy_strength=0.01,
                  print_freq=10,
                  render=False,
                  save_path=None,
@@ -186,6 +195,7 @@ class TrainA2C:
         self.output_dim = env.action_space.shape[0]
         self.actor_lr = actor_lr
         self.critic_lr = critic_lr
+        self.entropy = entropy_strength
         self.par_connections, self.child_connections = zip(*[mp.Pipe() for i in range(num_workers)])
         self.transition_queue = mp.Queue()
         self.rew_queue = mp.Queue()
@@ -196,6 +206,9 @@ class TrainA2C:
             rew_queue=self.rew_queue,
             env_name=self.env_name,
             render=self.render,
+            actor_lr=self.actor_lr,
+            critic_lr=self.critic_lr,
+            entropy_strength=self.entropy,
             input_dim=self.input_dim,
             output_dim=self.output_dim) for i in range(self.num_workers)]
         self.create_config()
@@ -219,7 +232,8 @@ class TrainA2C:
 
         with tf.device("/job:global/task:0"):
             self.ac = ContinuousActorCriticNetworkBuilder(self.input_dim, self.output_dim, actor_lr=self.actor_lr,
-                                                          critic_lr=self.critic_lr)
+                                                          critic_lr=self.critic_lr,
+                                                          entropy_strength=self.entropy)
 
     def add_summaries(self, log_dir):
         tf.summary.scalar('Value Loss', self.ac.critic_loss, )
@@ -371,6 +385,7 @@ def main():
                  env_name=FLAGS.env_name,
                  actor_lr=FLAGS.actor_lr,
                  critic_lr=FLAGS.critic_lr,
+                 entropy_strength=FLAGS.entropy,
                  max_steps=FLAGS.max_steps,
                  print_freq=FLAGS.print_freq,
                  render=FLAGS.render,
