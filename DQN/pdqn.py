@@ -4,14 +4,13 @@ import numpy as np
 import tensorflow as tf
 import matplotlib.pyplot as plt
 
-
 from util.network import QNetworkBuilder
 from util.replay_buffer import ReplayBuffer, PrioritizedReplayBuffer
 from tensorflow.python.platform import flags
 
 FLAGS = flags.FLAGS
 flags.DEFINE_string('env_name', 'CartPole-v0', 'Environment name')
-flags.DEFINE_string('save_path', '.', 'Save  location for the model')
+flags.DEFINE_string('save_path', './checkpoints', 'Save  location for the model')
 flags.DEFINE_string('log_path', './logs', 'Location to log training data')
 flags.DEFINE_float('learning_rate', 0.001, 'network learning rate')
 flags.DEFINE_float('gamma', 0.99, 'discount factor')
@@ -72,6 +71,7 @@ class TrainDQN:
         np.random.seed(seed)
         self.sess = sess
         self.env = env
+        self.env_name = env.spec.id
         self.input_dim = env.observation_space.shape[0]
         self.output_dim = env.action_space.n
         self.max_steps = max_steps
@@ -88,7 +88,7 @@ class TrainDQN:
         self.batch_size = batch_size
         self.num_updates = 0
         self.gamma = gamma
-        self.buffer = ReplayBuffer(capacity=max_steps // 2 if buffer_capacity is None else buffer_capacity)
+        self.buffer = PrioritizedReplayBuffer(capacity=max_steps // 2 if buffer_capacity is None else buffer_capacity)
         self.target_update_freq = target_update_freq
         self.learning_rate = learning_rate
 
@@ -194,7 +194,7 @@ class TrainDQN:
 
     def update(self):
         """Applies gradients to the Q network computed from a minibatch of self.batch_size."""
-        if self.batch_size <= self.buffer.size():
+        if self.batch_size <= len(self.buffer):
             self.num_updates += 1
 
             # Update the Q network with model parameters from the target network
@@ -204,7 +204,7 @@ class TrainDQN:
 
             # Sample random minibatch of transitions from the replay buffer
             sample = self.buffer.sample(self.batch_size)
-            states, action, reward, next_states, done = sample
+            tds, num, states, action, reward, next_states, done = sample
 
             # Calculate discounted predictions for the subsequent states using target network
             next_state_pred = self.gamma * self.sess.run(self.target_network.output_pred,
@@ -230,11 +230,13 @@ class TrainDQN:
 
     def save(self):
         """Saves the Q network."""
-        self.q_network.saver.save(self.sess, self.save_path)
+        loc = f'{self.save_path}/{self.env_name}/{self.env_name}.ckpt'
+        self.q_network.saver.save(self.sess, loc)
 
     def load(self):
         """Loads the Q network."""
-        self.q_network.saver.restore(self.sess, self.save_path)
+        loc = f'{self.load_path}/{self.env_name}/{self.env_name}.ckpt'
+        self.q_network.saver.restore(self.sess, loc)
 
     def plot_rewards(self, path=None):
         """Plots rewards per episode.
