@@ -1,170 +1,240 @@
+import numpy as np
 import tensorflow as tf
 
 
-class NetworkBuilder:
-    def __init__(self, input_dim, output_dim, layers=(512,), activations=(tf.nn.relu, None),
-                 conv=False):
-        """Creates a neural network. Derived classes handle specific losses and opts.
-        Args:
-            input_dim: Input dimensions
-            output_dim: Output dimensions
-            layers: list of hidden unit numbers for each layer
-            activations: activations for each layer
-            conv: True for convolutional neural network, False for multi-layer perceptron
-        """
-        assert len(layers) > 0, 'There must be at least one hidden layer'
+def conv2d(in_ph, reuse=False):
+    network = tf.contrib.layers.conv2d(in_ph, 32, kernel_size=8, activation_fn=tf.nn.relu, stride=4, scope='conv1',
+                                       reuse=reuse)
+    network = tf.contrib.layers.conv2d(network, 64, kernel_size=4, activation_fn=tf.nn.relu, stride=2, scope='conv2',
+                                       reuse=reuse)
+    network = tf.contrib.layers.conv2d(network, 64, kernel_size=3, activation_fn=tf.nn.relu, stride=1, scope='conv3',
+                                       reuse=reuse)
+    network = tf.contrib.layers.flatten(network)
+    network = tf.contrib.layers.fully_connected(network, 512, activation_fn=tf.nn.relu, scope='conv_lin', reuse=reuse)
+    return network
 
-        self.input_dim = input_dim
-        self.output_dim = output_dim
-        self.layer_sizes = layers
-        self.activations = activations
-        self.conv = conv
 
-    def create_network(self):
-        """Creates a neural network.
-        Returns:
-            input_ph: Placeholder for the inputs.
-            output_pred: Tensor for the output layer.
-        """
-        if self.conv:
-            input_ph = tf.placeholder(dtype=tf.float32, shape=[None, *self.input_dim])
-            network = tf.contrib.layers.conv2d(input_ph, 32, kernel_size=8, activation_fn=tf.nn.relu, stride=4)
-            network = tf.contrib.layers.conv2d(network, 64, kernel_size=4, activation_fn=tf.nn.relu, stride=2)
-            network = tf.contrib.layers.conv2d(network, 64, kernel_size=3, activation_fn=tf.nn.relu, stride=1)
-            network = tf.contrib.layers.flatten(network)
-            network = tf.contrib.layers.fully_connected(network, 512, activation_fn=tf.nn.relu)
-            output_pred = tf.contrib.layers.fully_connected(network, self.output_dim, activation_fn=None)
+def forward(in_ph, layers=(512,), activations=(tf.nn.relu,), reuse=False, scope=''):
+    assert len(layers) == len(activations)
+    network = in_ph
+    for i in range(len(layers)):
+        network = tf.contrib.layers.fully_connected(network, layers[i], activation_fn=activations[i],
+                                                    scope=f'{scope}fc_{i}',
+                                                    reuse=reuse)
+    return network
+
+
+def cross_entropy_loss(logits, actions_ph, baseline_ph, entropy_strength=0.0):
+    # Create loss function for policy gradient
+    assert logits.get_shape().as_list() == actions_ph.get_shape().as_list()
+    entropy = -tf.reduce_sum(logits * tf.log(logits + 1e-6))
+
+    # Choose which actions to adjust probability for
+    negative_likelihoods = tf.nn.softmax_cross_entropy_with_logits(labels=actions_ph, logits=logits)
+    weighted_negative_likelihoods = tf.multiply(negative_likelihoods, baseline_ph)
+    loss = tf.reduce_mean(weighted_negative_likelihoods) - entropy_strength * entropy
+    return loss, entropy
+
+
+def l2_weight_loss(scope='', l2_coef=0.01, extras=tuple()):
+    variables = tf.trainable_variables(scope=scope)
+    prefixes = list(extras) + ['weight']
+    weights = [v for v in variables if any(x in v.name for x in prefixes)]
+    reg = tf.reduce_mean([tf.nn.l2_loss(w) for w in weights])
+    return l2_coef * reg
+
+
+class PolicyBuilder:
+    def _make_input_placeholders(self):
+        raise NotImplementedError()
+
+    def _make_target_placeholders(self):
+        raise NotImplementedError()
+
+    def update(self, sess, merged, s, a, r, ns, d):
+        raise NotImplementedError()
+
+    def add_summaries(self):
+        raise NotImplementedError()
+
+
+class DQNPolicyBuilder(PolicyBuilder):
+    def __init__(self, in_dim, out_dim, learning_rate=1e-3, gamma=0.99, extract='mlp'):
+        scope = tf.get_variable_scope()
+        self.target_network = None
+        self.update_target_network_op = None
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.gamma = gamma
+        self.in_ph, self.is_weights = self._make_input_placeholders()
+        self.action_indices_ph, self.q_target = self._make_target_placeholders()
+
+        # Forward pass
+        if extract == 'mlp':
+            self.out_pred = forward(self.in_ph, layers=(512, self.out_dim), activations=(tf.nn.relu, None))
+        elif extract == 'cnn':
+            self.out_pred = conv2d(self.in_ph)
         else:
-            weights = [tf.get_variable(name='W0',
-                                       shape=[self.input_dim, self.layer_sizes[0]],
-                                       initializer=tf.contrib.layers.xavier_initializer())]
-            biases = [tf.get_variable(name=f'b0',
-                                      shape=[self.layer_sizes[0]],
-                                      initializer=tf.constant_initializer(0.))]
-            for i in range(1, len(self.layer_sizes)):
-                in_dim = weights[-1].shape[1].value
-                out_dim = self.layer_sizes[i]
-                weights.append(tf.get_variable(name=f'W{i}',
-                                               shape=[in_dim, out_dim],
-                                               initializer=tf.contrib.layers.xavier_initializer()))
-                biases.append(tf.get_variable(name=f'b{i}',
-                                              shape=[out_dim],
-                                              initializer=tf.constant_initializer(0.)))
-
-            weights.append(tf.get_variable(name=f'W{len(self.layer_sizes)}',
-                                           shape=[self.layer_sizes[-1], self.output_dim],
-                                           initializer=tf.contrib.layers.xavier_initializer()))
-            biases.append(tf.get_variable(name=f'b{len(self.layer_sizes)}',
-                                          shape=[self.output_dim],
-                                          initializer=tf.constant_initializer(0.)))
-
-            # Create computation graph for network
-            input_ph = tf.placeholder(dtype=tf.float32, shape=[None, self.input_dim])
-            layer = input_ph
-            for W, b, activation in zip(weights, biases, self.activations):
-                layer = tf.nn.xw_plus_b(x=layer, weights=W, biases=b)
-                if activation is not None:
-                    layer = activation(layer)
-            output_pred = layer
-
-        return input_ph, output_pred
-
-
-class QNetworkBuilder(NetworkBuilder):
-    def __init__(self, input_dim, output_dim, layers=(512,), activations=(tf.nn.relu, None),
-                 conv=False, learning_rate=0.001):
-        """Creates a Q-network and defines ops."""
-        super(QNetworkBuilder, self).__init__(input_dim, output_dim, layers, activations, conv)
-        # Create variables
-        self.input_ph, self.output_pred = self.create_network()
-        self.target_ph = tf.placeholder(dtype=tf.float32, shape=[None])
-        self.action_indices_ph = tf.placeholder(dtype=tf.int32, shape=[None])
+            raise ValueError('Unknown feature extractor type')
 
         # Create loss function
         batch_range = tf.range(start=0, limit=tf.shape(self.action_indices_ph)[0])
         indices = tf.stack((batch_range, self.action_indices_ph), axis=1)
-        self.action_values = tf.gather_nd(self.output_pred, indices)
-        self.loss = tf.losses.mean_squared_error(self.target_ph, self.action_values)
+        self.action_values = tf.gather_nd(self.out_pred, indices)
+        self.loss = tf.losses.mean_squared_error(self.q_target, self.action_values, weights=self.is_weights)
 
         # Optimizer
-        self.adam = tf.train.AdamOptimizer(learning_rate=learning_rate)
-        self.opt = self.adam.minimize(self.loss)
+        self.opt = tf.train.AdamOptimizer(learning_rate=learning_rate).minimize(self.loss)
 
-        self.saver = tf.train.Saver()
+        # Save
+        self.variables = scope.trainable_variables()
+        self.saver = tf.train.Saver(self.variables)
+
+    def update(self, sess, merged, s, a, r, ns, d, is_weights=None):
+        summary, loss = sess.run([merged, self.opt], feed_dict=self.get_feed_dict(sess, s, a, r, ns, d, is_weights))
+        return summary
+
+    def add_summaries(self):
+        a = tf.summary.scalar('Loss', self.loss, )
+        b = tf.summary.scalar('Mean Estimated Value', tf.reduce_mean(self.out_pred))
+        return a, b
+
+    def get_feed_dict(self, sess, s, a, r, ns, d, is_weights=None):
+        feed = self.get_input_feed_dict(s, a, is_weights=is_weights)
+        feed.update(self.get_target_feed_dict(sess, a, ns, r, d))
+        return feed
+
+    def get_input_feed_dict(self, s, a, is_weights=None):
+        return {self.in_ph: s, self.action_indices_ph: a,
+                self.is_weights: np.ones(s.shape[0]) if is_weights is None else is_weights}
+
+    def get_target_feed_dict(self, sess, a, ns, r, d):
+        next_state_pred = self.gamma * sess.run(self.target_network.out_pred,
+                                                feed_dict=self.target_network.get_input_feed_dict(ns, a))
+
+        # Adjust the targets for non-terminal states
+        r = r.reshape(-1, 1)
+        targets = r
+        loc = np.argwhere(d != True).flatten()
+        if len(loc) > 0:
+            max_q = np.amax(next_state_pred, axis=1)
+            targets[loc] = np.add(
+                targets[loc],
+                max_q[loc].reshape(max_q[loc].shape[0], 1),
+                casting='unsafe')
+
+        return {self.q_target: targets.flatten()}
+
+    def set_target_network(self, target):
+        self.target_network = target
+        self.update_target_network_op = [old.assign(new) for (new, old) in
+                                         zip(self.variables, target.variables)]
+
+    def _make_input_placeholders(self):
+        in_ph = tf.placeholder(dtype=tf.float32, shape=[None, self.in_dim], name='state_input')
+        weights = tf.placeholder(dtype=tf.float32, shape=[None], name='importance_sampling_weights')
+        return in_ph, weights
+
+    def _make_target_placeholders(self):
+        target_ph = tf.placeholder(dtype=tf.float32, shape=[None], name='q_value_target')
+        action_indices_ph = tf.placeholder(dtype=tf.int32, shape=[None], name='action_indices')
+        return action_indices_ph, target_ph
 
 
-class ValueNetworkBuilder(NetworkBuilder):
-    def __init__(self, input_dim, layers=(512,), activations=(tf.nn.relu, None),
-                 conv=False, learning_rate=0.001):
-        """Creates a network for estimating the value function. Very similar to the QNetworkBuilder"""
-        super(ValueNetworkBuilder, self).__init__(input_dim, 1, layers, activations, conv)
-        # Create variables
-        self.input_ph, self.output_pred = self.create_network()
-        self.target_ph = tf.placeholder(dtype=tf.float32, shape=[None, 1])
-        # self.action_indices_ph = tf.placeholder(dtype=tf.int32, shape=[None])
+class DDPGPolicyBuilder(PolicyBuilder):
+    def __init__(self, in_dim, out_dim, critic_lr=1e-3, actor_lr=1e-4, gamma=0.99, extract='mlp', tau=1e-3):
+        scope = tf.get_variable_scope()
+        self.tau = tau
+        self.gamma = gamma
+        self.target = None
+        self.update_target_network_op = None
+        self.in_dim = in_dim
+        self.out_dim = out_dim
 
-        # Create loss function
-        self.loss = tf.losses.mean_squared_error(self.output_pred, self.target_ph)
+        # Build actor network
+        self.in_ph = self._make_input_placeholders()
+        self.q_target = self._make_target_placeholders()
 
-        # Optimizer
-        self.adam = tf.train.AdamOptimizer(learning_rate=learning_rate)
-        self.opt = self.adam.minimize(self.loss)
+        # Forward pass
+        if extract == 'mlp':
+            with tf.variable_scope('actor'):
+                self.actor_pred = forward(self.in_ph, layers=(512, self.out_dim), activations=(tf.nn.relu, None))
+            q_input = tf.concat([self.in_ph, self.actor_pred], axis=1)
+            with tf.variable_scope('critic'):
+                self.q_pred = forward(q_input, layers=(512, 1), activations=(tf.nn.relu, None))
+        elif extract == 'cnn':
+            self.actor_pred = conv2d(self.in_ph)
+        else:
+            raise ValueError('Unknown feature extractor type')
 
-        self.saver = tf.train.Saver()
+        # Create loss functions
+        self.actor_loss = tf.reduce_mean(-self.q_pred)
+        self.critic_loss = tf.losses.mean_squared_error(self.q_target, self.q_pred) + l2_weight_loss(
+            scope=f'{scope.name}/critic')
 
+        # Optimizers
+        self.critic_opt = tf.train.AdamOptimizer(learning_rate=critic_lr).minimize(self.critic_loss)
+        self.actor_variables = tf.trainable_variables(
+            scope=f'{scope.name}/actor')
+        self.actor_opt = tf.train.AdamOptimizer(learning_rate=actor_lr).minimize(self.actor_loss,
+                                                                                 var_list=self.actor_variables)
 
-class PolicyNetworkBuilder(NetworkBuilder):
-    def __init__(self, input_dim, output_dim, layers=(512,), activations=(tf.nn.relu, tf.nn.softmax),
-                 conv=False, learning_rate=0.001):
-        """Creates a network for policy gradient and defines ops."""
-        super(PolicyNetworkBuilder, self).__init__(input_dim, output_dim, layers, activations, conv)
+        # Save
+        self.variables = scope.trainable_variables()
+        self.saver = tf.train.Saver(self.variables)
 
-        # Create additional inputs
-        self.input_ph, self.output_pred = self.create_network()
-        if conv:
-            self.output_pred = tf.nn.softmax(self.output_pred)
-        self.baseline_ph = tf.placeholder(dtype=tf.float32, shape=[None], name='Baseline')
-        self.actions_ph = tf.placeholder(dtype=tf.float32, shape=[None, self.output_dim], name='actions')
+    def update(self, sess, merged, s, a, r, ns, d):
+        summary, _, _ = sess.run([merged, self.critic_opt, self.actor_opt],
+                                 feed_dict=self.get_feed_dict(sess, s, a, r, ns, d))
+        return summary
 
-        # Create loss function for policy gradient
-        logits = self.output_pred
-        negative_likelihoods = tf.nn.softmax_cross_entropy_with_logits(labels=self.actions_ph, logits=logits)
-        weighted_negative_likelihoods = tf.multiply(negative_likelihoods, self.baseline_ph)
-        self.loss = tf.reduce_mean(weighted_negative_likelihoods)
-        # Optimizer
-        self.adam = tf.train.AdamOptimizer(learning_rate=learning_rate)
-        self.opt = self.adam.minimize(self.loss)
+    def get_feed_dict(self, sess, s, a, r, ns, d):
+        feed = self.get_input_feed_dict(s)
+        feed.update(self.get_target_feed_dict(sess, a, ns, r, d))
+        return feed
 
-        self.saver = tf.train.Saver()
+    def get_input_feed_dict(self, s):
+        return {self.in_ph: s}
 
+    def get_target_feed_dict(self, sess, a, ns, r, d):
+        next_state_pred = self.gamma * sess.run(self.target.q_pred,
+                                                feed_dict=self.target._get_input_feed_dict(ns))
 
-class ActorCriticNetworkBuilder:
-    """Creates a network for A2C and A3C and defines ops"""
+        # Adjust the targets for non-terminal states
+        r = r.reshape(-1, 1)
+        targets = r
+        loc = np.argwhere(d != True).flatten()
+        if len(loc) > 0:
+            max_q = np.amax(next_state_pred, axis=1)
+            targets[loc] = np.add(
+                targets[loc],
+                max_q[loc].reshape(max_q[loc].shape[0], 1),
+                casting='unsafe')
 
-    def __init__(self, input_dim, output_dim, actor_layers=(512,), critic_layers=(512,),
-                 actor_activations=(tf.nn.relu, tf.nn.softmax),
-                 critic_activations=(tf.nn.relu, None), conv=False, continuous=False, actor_lr=0.0001, critic_lr=0.001):
-        # Create two networks: one for the policy and one for the value function
-        with tf.variable_scope('actor'):
-            self.actor = PolicyNetworkBuilder(input_dim=input_dim,
-                                              output_dim=output_dim,
-                                              layers=actor_layers,
-                                              activations=actor_activations,
-                                              conv=conv,
-                                              learning_rate=actor_lr)
-        with tf.variable_scope('critic'):
-            self.critic = ValueNetworkBuilder(input_dim=input_dim,
-                                              layers=critic_layers,
-                                              activations=critic_activations,  # Value function needs linear output
-                                              conv=conv,
-                                              learning_rate=critic_lr)
+        return {self.q_target: targets}
 
-        self.saver = tf.train.Saver()
+    def add_summaries(self):
+        a = tf.summary.scalar('Actor Loss', self.actor_loss, )
+        b = tf.summary.scalar('Critic Loss', self.critic_loss, )
+        c = tf.summary.scalar('Mean Estimated Value', tf.reduce_mean(self.q_pred))
+        return a, b, c
 
+    def set_target(self, target):
+        self.target = target
+        self.update_target_network_op = [old.assign(self.tau * old + (1 - self.tau) * new) for (new, old) in
+                                         zip(self.variables, target.variables)]
+
+    def _make_input_placeholders(self):
+        in_ph = tf.placeholder(tf.float32, [None, self.in_dim], 'obs_input')
+        return in_ph
+
+    def _make_target_placeholders(self):
+        target_ph = tf.placeholder(dtype=tf.float32, shape=[None, 1], name='q_value_target')
+        return target_ph
 
 
 def main():
-    qnb = QNetworkBuilder(1, 1)
+    dqn = DQNPolicyBuilder(1, 1)
 
 
 if __name__ == '__main__':

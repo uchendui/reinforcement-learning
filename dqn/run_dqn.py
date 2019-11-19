@@ -3,18 +3,19 @@ import time
 import numpy as np
 import tensorflow as tf
 
-from DQN.pdqn import TrainDQN
+from dqn import TrainDQN
 from util.replay_buffer import PrioritizedReplayBuffer
 from tensorflow.python.platform import flags
 
 FLAGS = flags.FLAGS
 flags.DEFINE_integer('max_episodes', 10, 'Maximum number of episodes to run')
-flags.DEFINE_string('buffer_save_path', './replay_buffer', 'Save location for the replay buffer')
+flags.DEFINE_string('buffer_save_path', './buffers', 'Save location for the replay buffer')
 
 
 def main():
     with tf.Session() as sess:
         env = gym.make(FLAGS.env_name)
+
         dqn = TrainDQN(env,
                        sess,
                        max_steps=0,
@@ -23,7 +24,7 @@ def main():
         dqn.load()
         num_episodes = FLAGS.max_episodes
 
-        buffer = PrioritizedReplayBuffer(capacity=FLAGS.max_episode_len * FLAGS.max_episodes)
+        buffer = PrioritizedReplayBuffer(capacity=env.spec.max_episode_steps * FLAGS.max_episodes)
         reward = 0
         obs = env.reset()
         while num_episodes > 0:
@@ -44,7 +45,10 @@ def main():
                 obs = env.reset()
                 print('Episode Reward:', reward)
                 reward = 0
-        buffer.save(FLAGS.buffer_save_path)
+
+        loc = f'{FLAGS.buffer_save_path}/{FLAGS.env_name}/{FLAGS.env_name}.npy'
+        buffer.save(loc)
+
 
 if __name__ == '__main__':
     main()

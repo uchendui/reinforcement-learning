@@ -3,15 +3,13 @@ import gym
 import numpy as np
 import tensorflow as tf
 import matplotlib.pyplot as plt
-
-
 from util.network import QNetworkBuilder
 from util.replay_buffer import ReplayBuffer, PrioritizedReplayBuffer
 from tensorflow.python.platform import flags
 
 FLAGS = flags.FLAGS
 flags.DEFINE_string('env_name', 'CartPole-v0', 'Environment name')
-flags.DEFINE_string('save_path', '.', 'Save  location for the model')
+flags.DEFINE_string('save_path', './checkpoints', 'Save  location for the model')
 flags.DEFINE_string('log_path', './logs', 'Location to log training data')
 flags.DEFINE_float('learning_rate', 0.001, 'network learning rate')
 flags.DEFINE_float('gamma', 0.99, 'discount factor')
@@ -72,6 +70,7 @@ class TrainDQN:
         np.random.seed(seed)
         self.sess = sess
         self.env = env
+        self.env_name = env.spec.id
         self.input_dim = env.observation_space.shape[0]
         self.output_dim = env.action_space.n
         self.max_steps = max_steps
@@ -88,7 +87,7 @@ class TrainDQN:
         self.batch_size = batch_size
         self.num_updates = 0
         self.gamma = gamma
-        self.buffer = ReplayBuffer(capacity=max_steps // 2 if buffer_capacity is None else buffer_capacity)
+        self.buffer = PrioritizedReplayBuffer(capacity=max_steps // 2 if buffer_capacity is None else buffer_capacity)
         self.target_update_freq = target_update_freq
         self.learning_rate = learning_rate
 
@@ -99,12 +98,9 @@ class TrainDQN:
         self.update_target_network = [old.assign(new) for (new, old) in
                                       zip(tf.trainable_variables('q_network'),
                                           tf.trainable_variables('target_network'))]
-        if self.load_path is not None:
-            self.load()
+        self._add_summaries(log_dir)
 
-        self.add_summaries(log_dir)
-
-    def add_summaries(self, log_dir):
+    def _add_summaries(self, log_dir):
         tf.summary.scalar('Loss', self.q_network.loss, )
         tf.summary.scalar('Mean Estimated Value', tf.reduce_mean(self.q_network.output_pred))
         # Merge all the summaries and write them out to log_dir
@@ -135,13 +131,15 @@ class TrainDQN:
 
             # Execute action in emulator and observe reward and next state
             new_obs, reward, done, info = self.env.step(action)
+            if reward > 0:
+                print('Got the reward')
             total_reward += reward
 
             # Store transition s_t, a_t, r_t, s_t+1 in replay buffer
             self.buffer.add((obs, action, reward, new_obs, done))
 
             # Perform learning step
-            self.update()
+            self._update()
 
             obs = new_obs
             ep_len += 1
@@ -176,8 +174,6 @@ class TrainDQN:
                     # Model saving inspired by Open AI Baseline implementation
                     if (mean_reward is None or new_mean_reward >= mean_reward) and self.save_path is not None:
                         print(f"Saving model due to mean reward increase:{mean_reward} -> {new_mean_reward}")
-                        print(f'Location: {self.save_path}')
-                        # save_path = f"{self.save_path}_model"
                         self.save()
                         mean_reward = new_mean_reward
 
@@ -192,24 +188,23 @@ class TrainDQN:
                              feed_dict={self.q_network.input_ph: np.reshape(observation, (1, self.input_dim))})
         return np.argmax(pred)
 
-    def update(self):
+    def _update(self):
         """Applies gradients to the Q network computed from a minibatch of self.batch_size."""
-        if self.batch_size <= self.buffer.size():
+        if self.batch_size <= len(self.buffer):
             self.num_updates += 1
 
             # Update the Q network with model parameters from the target network
             if self.num_updates % self.target_update_freq == 0:
                 self.sess.run(self.update_target_network)
-                print('Updated Target Network')
 
             # Sample random minibatch of transitions from the replay buffer
             sample = self.buffer.sample(self.batch_size)
-            states, action, reward, next_states, done = sample
-
+            (tds, num, states, action, reward, next_states, done), inds = sample
             # Calculate discounted predictions for the subsequent states using target network
             next_state_pred = self.gamma * self.sess.run(self.target_network.output_pred,
-                                                         feed_dict={
-                                                             self.target_network.input_ph: next_states}, )
+                                                         feed_dict={self.target_network.input_ph: next_states}, )
+            state_pred = self.sess.run(self.q_network.output_pred,
+                                       feed_dict={self.q_network.input_ph: states}, )
 
             # Adjust the targets for non-terminal states
             reward = reward.reshape(len(reward), 1)
@@ -222,6 +217,12 @@ class TrainDQN:
                     max_q[loc].reshape(max_q[loc].shape[0], 1),
                     casting='unsafe')
 
+            # Compute TD Error for updating the prioritized replay buffer
+            rang = np.arange(len(action))
+            curr_q = state_pred[rang, action]
+            td_error = np.abs(targets.flatten() - curr_q)
+            self.buffer.update_priorities(indices=inds, tds=td_error)
+
             # Update discount factor and train model on batch
             _, loss = self.sess.run([self.q_network.opt, self.q_network.loss],
                                     feed_dict={self.q_network.input_ph: states,
@@ -230,11 +231,15 @@ class TrainDQN:
 
     def save(self):
         """Saves the Q network."""
-        self.q_network.saver.save(self.sess, self.save_path)
+        loc = f'{self.save_path}/{self.env_name}/{self.env_name}.ckpt'
+        self.q_network.saver.save(self.sess, loc)
+        print(f'Successfully saved model to: {loc}')
 
     def load(self):
         """Loads the Q network."""
-        self.q_network.saver.restore(self.sess, self.save_path)
+        loc = f'{self.load_path}/{self.env_name}/{self.env_name}.ckpt'
+        self.q_network.saver.restore(self.sess, loc)
+        print(f'Successfully loaded model from {loc}')
 
     def plot_rewards(self, path=None):
         """Plots rewards per episode.
@@ -253,7 +258,7 @@ class TrainDQN:
 
 def main():
     with tf.Session() as sess:
-        env_name = 'CartPole-v0'
+        env_name = FLAGS.env_name
         env = gym.make(env_name)
 
         dqn = TrainDQN(env=env,

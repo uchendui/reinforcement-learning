@@ -13,6 +13,16 @@ sys.path.append('../')
 from util.ports import find_open_ports
 from util.network import ActorCriticNetworkBuilder
 from util.misc import to_one_hot
+from tensorflow.python.platform import flags
+
+FLAGS = flags.FLAGS
+flags.DEFINE_integer('max_episodes', 10, 'Maximum number of episodes to run')
+flags.DEFINE_integer('threads', 8, 'number of processes for training')
+flags.DEFINE_integer('max_steps', 10000, 'number of processes for training')
+flags.DEFINE_integer('n_step', 10, 'number of steps to boostrap for reward')
+flags.DEFINE_integer('print_freq', 10, 'number of episodes between printing stats')
+flags.DEFINE_bool('render', False, 'render the environment')
+flags.DEFINE_string('env_name', 'CartPole-v0', 'Environment name')
 
 MSG_STOP = 'stop'
 MSG_STEP = 'step'
@@ -28,6 +38,7 @@ class Worker(mp.Process):
                  env_name,
                  input_dim,
                  output_dim,
+                 n_step,
                  render):
         super(Worker, self).__init__()
         self.id = worker_id
@@ -36,6 +47,7 @@ class Worker(mp.Process):
         self.output_dim = output_dim
         self.render = render
         self.conn = conn
+        self.n_step = n_step
         self.exp_queue = exp_queue
         self.rew_queue = rew_queue
         self.episode_reward = 0
@@ -88,17 +100,23 @@ class Worker(mp.Process):
 
     def step(self):
         """Performs a single step of the environment and adds a transition to the experience queue."""
-        if self.render:
-            self.env.render()
-        action = self.act(self.obs)
-        obs, rew, done, _ = self.env.step(action)
-        self.episode_reward += rew
-        self.exp_queue.put((self.obs, action, rew, obs, done))
-        self.obs = obs
-        if done:
-            self.obs = self.env.reset()
-            self.rew_queue.put(self.episode_reward)
-            self.episode_reward = 0
+        exp = []
+
+        for i in range(self.n_step):
+            if self.render:
+                self.env.render()
+            action = self.act(self.obs)
+            obs, rew, done, _ = self.env.step(action)
+            self.episode_reward += rew
+            exp.append((self.obs, action, rew, obs, done))
+            self.obs = obs
+            if done:
+                self.obs = self.env.reset()
+                self.rew_queue.put(self.episode_reward)
+                self.episode_reward = 0
+                break
+
+        self.exp_queue.put(exp)
 
 
 class TrainA2C:
@@ -108,6 +126,7 @@ class TrainA2C:
                  gamma=0.99,
                  max_steps=40000,
                  print_freq=10,
+                 n_step=1,
                  render=False,
                  save_path=None,
                  load_path=None):
@@ -125,6 +144,7 @@ class TrainA2C:
         self.rew_queue = mp.Queue()
         self.workers = [Worker(
             worker_id=i,
+            n_step=n_step,
             conn=self.child_connections[i],
             exp_queue=self.transition_queue,
             rew_queue=self.rew_queue,
@@ -169,7 +189,24 @@ class TrainA2C:
                 samples.append(self.transition_queue.get())
                 not_rec -= 1
 
-        return list(map(np.array, zip(*samples)))
+        return samples
+
+    def calculate_n_step_returns(self, batch):
+        obs = action = reward = next_obs = done = None
+        for seq in batch:
+            s, a, r, ns, d = list(map(np.array, zip(*seq)))
+            val = self.sess.run(self.ac.critic.output_pred, feed_dict={self.ac.critic.input_ph: s[-1].reshape(1, -1)})
+            r[-1] += val if not d[-1] else 0
+
+            for i in range(d.shape[0] - 2, -1, -1):
+                r[i] = r[i] + self.gamma * r[i + 1]
+
+            obs = s if obs is None else np.concatenate((obs, s))
+            next_obs = ns if next_obs is None else np.concatenate((next_obs, ns))
+            action = a if action is None else np.concatenate((action, a))
+            reward = r if reward is None else np.concatenate((reward, r))
+            done = d if done is None else np.concatenate((done, r))
+        return obs, action, reward, next_obs, done
 
     def update(self, states, action, reward, next_states, done):
         """Updates the actor and critic networks.
@@ -188,26 +225,15 @@ class TrainA2C:
         #######################################################
         # Update value function network (critic)
         #######################################################
-        next_state_values = self.gamma * self.sess.run(self.ac.critic.output_pred,
-                                                       feed_dict={self.ac.critic.input_ph: next_states})
         state_values = self.sess.run(self.ac.critic.output_pred, feed_dict={self.ac.critic.input_ph: states})
-
-        # Adjust the targets for non-terminal states
-        targets = np.copy(reward)
-        loc = np.argwhere(done != True).flatten()
-        if len(loc) > 0:
-            targets[loc] = np.add(
-                targets[loc],
-                next_state_values[loc].reshape(next_state_values[loc].shape[0], 1), casting='unsafe')
-
         _, value_loss = self.sess.run([self.ac.critic.opt, self.ac.critic.loss],
                                       feed_dict={self.ac.critic.input_ph: states,
-                                                 self.ac.critic.target_ph: targets})
+                                                 self.ac.critic.target_ph: reward})
 
         #######################################################
         # Update actor network
         #######################################################
-        advantage = (reward + next_state_values) - state_values
+        advantage = reward - state_values
         _, policy_loss = self.sess.run([self.ac.actor.opt, self.ac.actor.loss],
                                        feed_dict={self.ac.actor.input_ph: states,
                                                   self.ac.actor.baseline_ph: advantage.flatten(),
@@ -225,6 +251,9 @@ class TrainA2C:
             # Aggregate transitions
             batch = self.get_transitions()
 
+            # Modify n step returns
+            batch = self.calculate_n_step_returns(batch)
+
             # Update the actor and critic models
             self.update(*batch)
 
@@ -238,7 +267,7 @@ class TrainA2C:
                 print(f"-------------------------------------------------------")
                 print(f"Mean {self.print_freq} Episode Reward: {new_mean_reward}")
                 print(f"Total Episodes: {ep}")
-                print(f"Total updates: {(t + 1) * self.num_workers}")
+                print(f"Total timesteps: {(t + 1) * self.num_workers}")
                 print(f"-------------------------------------------------------")
         self.send_message(MSG_STOP)
 
@@ -281,7 +310,12 @@ def main():
     # The default method, "fork", copies over the tensorflow module from the parent process
     #   which is problematic w.r.t GPU resources
     mp.set_start_method('spawn')
-    t = TrainA2C(4, 'CartPole-v0', max_steps=10000, print_freq=10, render=False)
+    t = TrainA2C(FLAGS.threads,
+                 FLAGS.env_name,
+                 n_step=FLAGS.n_step,
+                 max_steps=FLAGS.max_steps,
+                 print_freq=FLAGS.print_freq,
+                 render=FLAGS.render)
     t.start()
 
 

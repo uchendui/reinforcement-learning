@@ -10,4 +10,8 @@ def to_one_hot(indices, num_actions):
         indices:
         num_actions: Number of possible actions. (length of one-hot vector)
     """
-    return np.eye(num_actions)[indices]
+    indices = np.atleast_1d(indices).astype(dtype=np.int32, copy=False)
+    n_rows = len(indices)
+    arr = np.zeros((n_rows, num_actions))
+    arr[np.arange(n_rows), indices] = 1
+    return arr
