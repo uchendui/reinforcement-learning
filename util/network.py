@@ -58,6 +58,12 @@ class PolicyBuilder:
         raise NotImplementedError()
 
 
+class A2CPolicyBuilder(PolicyBuilder):
+    scope = tf.get_variable_scope()
+
+    pass
+
+
 class DQNPolicyBuilder(PolicyBuilder):
     def __init__(self, in_dim, out_dim, learning_rate=1e-3, gamma=0.99, extract='mlp'):
         scope = tf.get_variable_scope()
