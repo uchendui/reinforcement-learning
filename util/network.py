@@ -1,6 +1,8 @@
 import numpy as np
 import tensorflow as tf
 
+from util.misc import to_one_hot
+
 
 def conv2d(in_ph, reuse=False):
     network = tf.contrib.layers.conv2d(in_ph, 32, kernel_size=8, activation_fn=tf.nn.relu, stride=4, scope='conv1',
@@ -59,9 +61,81 @@ class PolicyBuilder:
 
 
 class A2CPolicyBuilder(PolicyBuilder):
-    scope = tf.get_variable_scope()
 
-    pass
+    def __init__(self, in_dim, out_dim, learning_rate=1e-3, gamma=0.99, entropy=1e-2, l2_coef=1e-3, extract='mlp'):
+        scope = tf.get_variable_scope()
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.gamma = gamma
+        self.entropy = entropy
+        self.extract = extract
+        self.in_ph, self.baseline, self.action_ph = self._make_input_placeholders()
+        self.value_ph = self._make_target_placeholders()
+
+        # Forward pass
+        features = self.in_ph
+        if extract == 'cnn':
+            features = conv2d(features)
+
+        with tf.variable_scope('critic'):
+            self.value_pred = forward(features, layers=(32, 32, 1), activations=(tf.nn.relu, tf.nn.relu, None))
+        with tf.variable_scope('actor'):
+            self.out_pred = forward(features, layers=(32, 32, self.out_dim),
+                                    activations=(tf.nn.relu, tf.nn.relu, tf.nn.softmax))
+
+        self.critic_loss = tf.losses.mean_squared_error(self.value_pred, self.value_ph)
+        self.actor_loss, self.entropy_value = cross_entropy_loss(
+            logits=self.out_pred,
+            actions_ph=self.action_ph,
+            baseline_ph=self.baseline,
+            entropy_strength=self.entropy)
+        self.l2_loss = l2_weight_loss(l2_coef=l2_coef, scope=scope.name)
+        self.loss = self.critic_loss + self.actor_loss + self.l2_loss
+
+        # Optimizer
+        self.opt = tf.train.AdamOptimizer(learning_rate=learning_rate).minimize(self.loss)
+
+        # Save
+        self.variables = scope.trainable_variables()
+        self.saver = tf.train.Saver(self.variables)
+
+    def _make_input_placeholders(self):
+        in_ph = tf.placeholder(dtype=tf.float32, shape=[None, self.in_dim], name='state_input')
+        baseline_ph = tf.placeholder(dtype=tf.float32, shape=[None, 1], name='baseline_input')
+        actions_ph = tf.placeholder(dtype=tf.float32, shape=[None, self.out_dim], name='action_input')
+        return in_ph, baseline_ph, actions_ph
+
+    def _make_target_placeholders(self):
+        value_ph = tf.placeholder(dtype=tf.float32, shape=[None, 1], name='critic_input')
+        return value_ph
+
+    def update(self, sess, merged, s, a, r, ns, d):
+        summary, _ = sess.run([merged, self.opt], feed_dict=self.get_feed_dict(sess, s, a, r))
+        return summary
+
+    def get_feed_dict(self, sess, s, a, r):
+        feed = self.get_input_feed_dict(s, a, )
+        feed.update(self.get_target_feed_dict(sess, s, r))
+        return feed
+
+    def get_input_feed_dict(self, s, a):
+        return {self.in_ph: s,
+                self.action_ph: to_one_hot(a, self.out_dim),
+                }
+
+    def get_target_feed_dict(self, sess, s, r, ):
+        r = r.reshape((-1, 1))
+        state_values = sess.run(self.value_pred, feed_dict={self.in_ph: s})
+        advantage = r - state_values
+        return {self.value_ph: r, self.baseline: advantage}
+
+    def add_summaries(self):
+        a = tf.summary.scalar('Loss', self.loss, )
+        b = tf.summary.scalar('Mean Estimated Value', tf.reduce_mean(self.value_pred))
+        c = tf.summary.scalar('Critic Loss', self.critic_loss, )
+        d = tf.summary.scalar('Policy Gradient Loss', self.actor_loss, )
+        e = tf.summary.scalar('Entropy', self.entropy_value, )
+        return a, b, c, d
 
 
 class DQNPolicyBuilder(PolicyBuilder):
@@ -76,12 +150,10 @@ class DQNPolicyBuilder(PolicyBuilder):
         self.action_indices_ph, self.q_target = self._make_target_placeholders()
 
         # Forward pass
-        if extract == 'mlp':
-            self.out_pred = forward(self.in_ph, layers=(512, self.out_dim), activations=(tf.nn.relu, None))
-        elif extract == 'cnn':
-            self.out_pred = conv2d(self.in_ph)
-        else:
-            raise ValueError('Unknown feature extractor type')
+        features = self.in_ph
+        if extract == 'cnn':
+            features = conv2d(features)
+        self.out_pred = forward(features, layers=(512, self.out_dim), activations=(tf.nn.relu, None))
 
         # Create loss function
         batch_range = tf.range(start=0, limit=tf.shape(self.action_indices_ph)[0])
